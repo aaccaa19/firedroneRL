@@ -1,4 +1,4 @@
-# This file contains the UOAREnv environment, RandomAgent, and main script in a single file for a flat structure.
+# This file contains the UOAREnv environment and RuleAgent in a single file for a flat structure.
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
@@ -84,12 +84,6 @@ class UOAREnv(gym.Env):
             self.im.set_data(img)
         plt.draw()
         plt.pause(0.1)
-
-class RandomAgent:
-    def __init__(self, action_space):
-        self.action_space = action_space
-    def act(self, observation):
-        return self.action_space.sample()
 
 class RuleAgent:
     def __init__(self, action_space, grid_size=10):
