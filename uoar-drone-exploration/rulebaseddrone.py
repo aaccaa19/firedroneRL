@@ -91,7 +91,7 @@ class RandomAgent:
     def act(self, observation):
         return self.action_space.sample()
 
-class UOARAgent:
+class RuleAgent:
     def __init__(self, action_space, grid_size=10):
         self.action_space = action_space
         self.grid_size = grid_size
@@ -157,8 +157,8 @@ class UOARAgent:
 
 def main():
     env = UOAREnv()
-    agent = UOARAgent(env.action_space, grid_size=env.grid_size)
-    num_episodes = 15000
+    agent = RuleAgent(env.action_space, grid_size=env.grid_size)
+    num_episodes = 100
     episode_rewards = []
     for episode in range(num_episodes):
         obs, info = env.reset()
@@ -188,7 +188,7 @@ def main():
     plt.plot(range(1, num_episodes+1), episode_rewards, marker='o')
     plt.xlabel('Episode')
     plt.ylabel('Total Points')
-    plt.title('UOAR Drone: Total Points per Episode')
+    plt.title('Rule Drone: Total Points per Episode')
     plt.grid(True)
     plt.show()
 
