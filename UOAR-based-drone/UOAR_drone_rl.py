@@ -133,7 +133,7 @@ class DroneEnv(gym.Env):
                                 seen_grids[i].add((gx, gy))
                                 new_cells += 1
                 if new_cells > 0:
-                    rewards[i] += 5  # exploration reward set to 5
+                    rewards[i] += 20  # exploration reward set to 10 (greater reward)
         self.done = dones
         return self._get_obs(), rewards, dones, False, {}
 
@@ -390,6 +390,9 @@ def main():
         seen_areas = [[], []]
         # Track seen grid cells for exploration reward
         seen_grids = [set(), set()]
+        # Wait for user input before visualizing the last episode
+        if episode == num_episodes - 1:
+            input("Press Enter to play the last episode...")
         while not all(done) and steps < 100:
             actions = np.zeros((env.n_drones, 3))
             for i in range(env.n_drones):
