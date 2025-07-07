@@ -83,7 +83,7 @@ class DroneEnv(gym.Env):
 
     def step(self, actions, seen_grids=None):
         actions = np.clip(actions, -1, 1)
-        rewards = [1, 1]
+        rewards = [0, 0]  # Remove per-step survival reward
         dones = [False, False]
         # Move both drones
         for i in range(self.n_drones):
@@ -100,10 +100,16 @@ class DroneEnv(gym.Env):
             closest = a + t * ab
             return np.linalg.norm(p - closest)
         min_dist = self.drone_radius + self.fire_radius + self.safety_margin
+        alpha = 2.5  # much sharper exponential curve for proximity
+        proximity_scale = 100.0  # much higher scale for proximity reward
         for i in range(self.n_drones):
             dist = point_to_segment_dist(self.drone_pos[i], self.fire_line[0], self.fire_line[1])
-            if dist <= min_dist:
-                rewards[i] = -10
+            # Exponential reward for proximity to fire (very steep, but zero if touching)
+            if dist > min_dist:
+                exp_reward = proximity_scale * np.exp(-alpha * (dist - min_dist))
+                rewards[i] += exp_reward
+            else:
+                rewards[i] = -100  # much larger penalty for fire collision
                 dones[i] = True
         # Drone-drone collision
         if np.linalg.norm(self.drone_pos[0] - self.drone_pos[1]) < 2*self.drone_radius + self.safety_margin:
@@ -133,7 +139,18 @@ class DroneEnv(gym.Env):
                                 seen_grids[i].add((gx, gy))
                                 new_cells += 1
                 if new_cells > 0:
-                    rewards[i] += 20  # exploration reward set to 10 (greater reward)
+                    rewards[i] += 100  # increased exploration reward
+        # Negative reward for proximity to edges/corners
+        edge_penalty_scale = 200.0  # much higher penalty
+        edge_penalty_alpha = 4.0    # much sharper penalty curve
+        for i in range(self.n_drones):
+            pos = self.drone_pos[i]
+            # Distance to each wall (x=0, x=max, y=0, y=max, z=5, z=10)
+            dists = [pos[0], self.area_size - pos[0], pos[1], self.area_size - pos[1], pos[2] - 5, 10 - pos[2]]
+            min_dist = min(dists)
+            # Exponential penalty as drone approaches any wall/corner
+            edge_penalty = edge_penalty_scale * np.exp(-edge_penalty_alpha * min_dist)
+            rewards[i] -= edge_penalty
         self.done = dones
         return self._get_obs(), rewards, dones, False, {}
 
