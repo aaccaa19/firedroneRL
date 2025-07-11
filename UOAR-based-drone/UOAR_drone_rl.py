@@ -382,7 +382,7 @@ class TD3Agent:
 
 # --- MAIN LOOP ---
 def main():
-    num_episodes = 10
+    num_episodes = 1000
     env = DroneEnv()
     obs_dim = env.observation_space.shape[1]
     act_dim = env.action_space.shape[1]
