@@ -22,6 +22,14 @@ class DroneEnv(gym.Env):
         low = np.array([0,0,0,0,0,0,0]*self.n_drones).reshape((self.n_drones,7))
         high = np.array([area_size,area_size,area_size,1,area_size,area_size,area_size]*self.n_drones).reshape((self.n_drones,7))
         self.observation_space = spaces.Box(low=low, high=high, shape=(self.n_drones,7), dtype=np.float32)
+        # --- Add cell_rewards for regenerating reward ---
+        grid_size = 0.5
+        grid_dim = int(self.area_size // grid_size)
+        self.grid_size = grid_size
+        self.grid_dim = grid_dim
+        self.max_cell_reward = 100
+        self.cell_regen_rate = 10
+        self.cell_rewards = np.full((grid_dim, grid_dim), self.max_cell_reward, dtype=np.int32)
         self.reset()
 
     def reset(self, seed=None, options=None):
@@ -52,6 +60,7 @@ class DroneEnv(gym.Env):
             pos2 = np.array([8.0, 8.0, 7.5])
         self.drone_pos = np.stack([pos1, pos2])
         self.done = [False, False]
+        self.cell_rewards = np.full((self.grid_dim, self.grid_dim), self.max_cell_reward, dtype=np.int32)  # Reset cell rewards to max
         return self._get_obs(), {}
 
     def _get_obs(self):
@@ -115,31 +124,41 @@ class DroneEnv(gym.Env):
         if np.linalg.norm(self.drone_pos[0] - self.drone_pos[1]) < 2*self.drone_radius + self.safety_margin:
             rewards = [-10, -10]
             dones = [True, True]
-        # Exploration reward (grid-based)
-        if seen_grids is not None:
-            k = 1.0
-            grid_size = 0.5  # tune as needed
-            for i in range(self.n_drones):
-                pos = self.drone_pos[i]
-                drone_xy = np.array([pos[0], pos[1]])
-                z = pos[2]
-                view_radius = k * z / 4
-                # Find grid cells within view_radius
-                x_min = max(0, int((drone_xy[0] - view_radius) // grid_size))
-                x_max = min(int(self.area_size // grid_size), int((drone_xy[0] + view_radius) // grid_size))
-                y_min = max(0, int((drone_xy[1] - view_radius) // grid_size))
-                y_max = min(int(self.area_size // grid_size), int((drone_xy[1] + view_radius) // grid_size))
-                new_cells = 0
-                for gx in range(x_min, x_max+1):
-                    for gy in range(y_min, y_max+1):
-                        cx = gx * grid_size + grid_size/2
-                        cy = gy * grid_size + grid_size/2
-                        if np.linalg.norm(drone_xy - np.array([cx, cy])) <= view_radius:
-                            if (gx, gy) not in seen_grids[i]:
-                                seen_grids[i].add((gx, gy))
-                                new_cells += 1
-                if new_cells > 0:
-                    rewards[i] += 100  # increased exploration reward
+        # Exploration reward (regenerating tile reward)
+        grid_size = self.grid_size
+        grid_dim = self.grid_dim
+        max_reward = self.max_cell_reward
+        regen_rate = self.cell_regen_rate
+        # Build a mask of which cells are seen by any drone this step
+        seen_mask = np.zeros((grid_dim, grid_dim), dtype=bool)
+        for i in range(self.n_drones):
+            pos = self.drone_pos[i]
+            drone_xy = np.array([pos[0], pos[1]])
+            z = pos[2]
+            view_radius = 1.0 * z / 4
+            x_min = max(0, int((drone_xy[0] - view_radius) // grid_size))
+            x_max = min(grid_dim - 1, int((drone_xy[0] + view_radius) // grid_size))
+            y_min = max(0, int((drone_xy[1] - view_radius) // grid_size))
+            y_max = min(grid_dim - 1, int((drone_xy[1] + view_radius) // grid_size))
+            for gx in range(x_min, x_max+1):
+                for gy in range(y_min, y_max+1):
+                    cx = gx * grid_size + grid_size/2
+                    cy = gy * grid_size + grid_size/2
+                    if np.linalg.norm(drone_xy - np.array([cx, cy])) <= view_radius:
+                        seen_mask[gx, gy] = True
+        # Give reward for seen cells, reset their reward to 0
+        for gx in range(grid_dim):
+            for gy in range(grid_dim):
+                if seen_mask[gx, gy]:
+                    reward = self.cell_rewards[gx, gy]
+                    if reward > 0:
+                        for i in range(self.n_drones):
+                            rewards[i] += reward
+                        self.cell_rewards[gx, gy] = 0
+                else:
+                    # Regenerate reward for unseen cells
+                    if self.cell_rewards[gx, gy] < max_reward:
+                        self.cell_rewards[gx, gy] = min(max_reward, self.cell_rewards[gx, gy] + regen_rate)
         # Negative reward for proximity to edges/corners
         edge_penalty_scale = 200.0  # much higher penalty
         edge_penalty_alpha = 4.0    # much sharper penalty curve
@@ -183,7 +202,7 @@ class DroneEnv(gym.Env):
             circle_x = drone_xy[0] + view_radius * np.cos(theta)
             circle_y = drone_xy[1] + view_radius * np.sin(theta)
             circle_z = np.zeros_like(theta)
-            ax.plot(circle_x, circle_y, circle_z, color='orange', alpha=0.7, linewidth=1.5)
+            ax.plot(circle_x, circle_y, circle_z, color='orange', alpha=0.6, linewidth=1.5)
             # Filled disk using Poly3DCollection
             verts = [list(zip(circle_x, circle_y, circle_z))]
             poly = Poly3DCollection(verts, color='orange', alpha=0.15)
@@ -382,7 +401,7 @@ class TD3Agent:
 
 # --- MAIN LOOP ---
 def main():
-    num_episodes = 1000
+    num_episodes = 5
     env = DroneEnv()
     obs_dim = env.observation_space.shape[1]
     act_dim = env.action_space.shape[1]
@@ -482,6 +501,70 @@ def main():
     plt.ylabel('Y')
     plt.legend()
     plt.show()
+
+    # --- Plot Exploration Reward Table (cell_rewards) ---
+    plt.figure(figsize=(6, 5))
+    plt.imshow(env.cell_rewards.T, origin='lower', cmap='YlOrRd', vmin=0, vmax=env.max_cell_reward)
+    plt.title('Exploration Reward Table (cell_rewards)')
+    plt.xlabel('Grid X')
+    plt.ylabel('Grid Y')
+    plt.colorbar(label='Cell Reward Value')
+    plt.tight_layout()
+    plt.show()
+
+    # --- Integrated Reward System Heatmap ---
+    # For each cell, calculate: proximity to fire reward + edge penalty + exploration reward
+    grid_size = env.grid_size
+    grid_dim = env.grid_dim
+    area_size = env.area_size
+    fire_line = env.fire_line
+    fire_radius = env.fire_radius
+    drone_radius = env.drone_radius
+    safety_margin = env.safety_margin
+    max_cell_reward = env.max_cell_reward
+    cell_rewards = env.cell_rewards
+    alpha = 0.7  # fire proximity exponential (more gradual)
+    proximity_scale = 100.0
+    edge_penalty_scale = 200.0
+    edge_penalty_alpha = 4.0
+    z = 7.5  # fixed height for analysis
+    integrated_reward = np.zeros((grid_dim, grid_dim))
+    def point_to_segment_dist(p, a, b):
+        ap = p - a
+        ab = b - a
+        t = np.dot(ap, ab) / (np.dot(ab, ab) + 1e-8)
+        t = np.clip(t, 0, 1)
+        closest = a + t * ab
+        return np.linalg.norm(p - closest)
+    for gx in range(grid_dim):
+        for gy in range(grid_dim):
+            cx = gx * grid_size + grid_size/2
+            cy = gy * grid_size + grid_size/2
+            pos = np.array([cx, cy, z])
+            # Proximity to fire
+            dist_fire = point_to_segment_dist(pos, fire_line[0], fire_line[1])
+            min_dist_fire = drone_radius + fire_radius + safety_margin
+            if dist_fire > min_dist_fire:
+                fire_reward = proximity_scale * np.exp(-alpha * (dist_fire - min_dist_fire))
+            else:
+                fire_reward = -100  # collision penalty
+            # Edge penalty
+            dists = [pos[0], area_size - pos[0], pos[1], area_size - pos[1], pos[2] - 5, 10 - pos[2]]
+            min_dist_edge = min(dists)
+            edge_penalty = edge_penalty_scale * np.exp(-edge_penalty_alpha * min_dist_edge)
+            # Exploration reward
+            exploration_reward = cell_rewards[gx, gy]
+            # Total
+            integrated_reward[gx, gy] = fire_reward - edge_penalty + exploration_reward
+    plt.figure(figsize=(6, 5))
+    plt.imshow(integrated_reward.T, origin='lower', cmap='coolwarm')
+    plt.title('Integrated Reward System Heatmap')
+    plt.xlabel('Grid X')
+    plt.ylabel('Grid Y')
+    plt.colorbar(label='Total Reward Value')
+    plt.tight_layout()
+    plt.show()
+
 
 if __name__ == "__main__":
     main()
