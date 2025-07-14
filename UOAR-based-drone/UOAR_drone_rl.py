@@ -118,7 +118,7 @@ class DroneEnv(gym.Env):
                 exp_reward = proximity_scale * np.exp(-alpha * (dist - min_dist))
                 rewards[i] += exp_reward
             else:
-                rewards[i] = -100  # much larger penalty for fire collision
+                rewards[i] = 0  # much larger penalty for fire collision
                 dones[i] = True
         # Drone-drone collision
         if np.linalg.norm(self.drone_pos[0] - self.drone_pos[1]) < 2*self.drone_radius + self.safety_margin:
@@ -291,7 +291,10 @@ class ReplayBuffer:
         )
 
 class TD3Agent:
-    def __init__(self, area_size, drone_radius, fire_line, fire_radius, safety_margin, max_step_size, obs_dim=7, act_dim=3, n_critics=2, n_candidates=10, noise_levels=[0.1,0.2,0.3], gamma=0.99, tau=0.005, policy_noise=0.2, noise_clip=0.5, policy_delay=2, buffer_size=100000, batch_size=64):
+    def decay_noise(self, decay_rate=0.99, min_noise=0.01):
+        """Decay the noise levels by decay_rate, not going below min_noise."""
+        self.noise_levels = [max(n * decay_rate, min_noise) for n in self.noise_levels]
+    def __init__(self, area_size, drone_radius, fire_line, fire_radius, safety_margin, max_step_size, obs_dim=7, act_dim=3, n_critics=2, n_candidates=10, noise_levels=[0.1,0.2,0.3], gamma=0.95, tau=0.005, policy_noise=0.1, noise_clip=0.2, policy_delay=2, buffer_size=100000, batch_size=128):
         self.area_size = area_size
         self.drone_radius = drone_radius
         self.fire_line = np.array(fire_line)
@@ -307,7 +310,7 @@ class TD3Agent:
         self.critics_target = nn.ModuleList([Critic(self.obs_dim, self.act_dim) for _ in range(n_critics)])
         for i in range(n_critics):
             self.critics_target[i].load_state_dict(self.critics[i].state_dict())
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=1e-3)
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=3e-4)
         self.critic_opts = [torch.optim.Adam(c.parameters(), lr=1e-3) for c in self.critics]
         self.buffer = ReplayBuffer(buffer_size, self.obs_dim, self.act_dim)
         self.gamma = gamma
@@ -352,7 +355,7 @@ class TD3Agent:
             dist = point_to_segment_dist(sim_pos, self.fire_line[0], self.fire_line[1])
             min_dist = self.drone_radius + self.fire_radius + self.safety_margin
             collision = dist <= min_dist
-            immediate_reward = -10 if collision else 1
+            immediate_reward = -100 if collision else 10
             # Long-term Q (average over critics)
             obs_t = torch.tensor(sim_obs, dtype=torch.float32).unsqueeze(0)
             act_t = torch.tensor(a, dtype=torch.float32).unsqueeze(0)
@@ -401,7 +404,7 @@ class TD3Agent:
 
 # --- MAIN LOOP ---
 def main():
-    num_episodes = 5
+    num_episodes = 10
     env = DroneEnv()
     obs_dim = env.observation_space.shape[1]
     act_dim = env.action_space.shape[1]
@@ -468,6 +471,9 @@ def main():
         print(f"Episode {episode+1}/{num_episodes} Total Rewards: {total_reward}")
         for i in range(env.n_drones):
             print(f"  Drone {i+1}: Total Points = {total_reward[i]}, Ended by: {crash_type[i]}")
+        # Decay noise for all agents after each episode
+        for agent in agents:
+            agent.decay_noise()
     # Remove non-blocking show here to avoid closing the stats plot
     # Plot total points per episode for each drone
     plt.ioff()  # Disable interactive mode for the stats plot
