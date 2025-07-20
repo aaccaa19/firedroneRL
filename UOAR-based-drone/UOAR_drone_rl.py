@@ -8,13 +8,16 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 # --- ENVIRONMENT ---
 class DroneEnv(gym.Env):
-    def __init__(self, area_size=10, drone_radius=0.5, fire_line=((5,5,0),(5,5,10)), fire_radius=0.5, safety_margin=0.2, max_step_size=0.5):
+    def __init__(self, area_size=10, drone_radius=0.5, fire_line=((5,5,0),(5,5,10)), fire_radius=0.5, safety_margin=0.2, max_step_size=0.5, curriculum_level=0):
         super().__init__()
         self.area_size = area_size
         self.drone_radius = drone_radius
         self.fire_line = np.array(fire_line)
         self.fire_radius = fire_radius
-        self.safety_margin = safety_margin
+        self.base_safety_margin = safety_margin
+        # Curriculum learning: start with larger safety margin, gradually reduce
+        self.curriculum_level = curriculum_level
+        self.safety_margin = safety_margin + max(0, (5 - curriculum_level) * 0.1)
         self.max_step_size = max_step_size
         self.n_drones = 2
         self.action_space = spaces.Box(low=-1, high=1, shape=(self.n_drones,3), dtype=np.float32)
@@ -27,8 +30,8 @@ class DroneEnv(gym.Env):
         grid_dim = int(self.area_size // grid_size)
         self.grid_size = grid_size
         self.grid_dim = grid_dim
-        self.max_cell_reward = 100
-        self.cell_regen_rate = 10
+        self.max_cell_reward = 50  # Reduced to not overwhelm fire proximity reward
+        self.cell_regen_rate = 5   # Slower regeneration
         self.cell_rewards = np.full((grid_dim, grid_dim), self.max_cell_reward, dtype=np.int32)
         self.reset()
 
@@ -108,23 +111,43 @@ class DroneEnv(gym.Env):
             t = np.clip(t, 0, 1)
             closest = a + t * ab
             return np.linalg.norm(p - closest)
-        min_dist = self.drone_radius + self.fire_radius + self.safety_margin
-        alpha = 2.5  # much sharper exponential curve for proximity
-        proximity_scale = 100.0  # much higher scale for proximity reward
+        
+        min_safe_dist = self.drone_radius + self.fire_radius + self.safety_margin
+        collision_dist = self.drone_radius + self.fire_radius  # Actual collision boundary
+        
+        # More gradual reward structure for fire proximity
+        alpha = 1.2  # Much gentler exponential curve
+        proximity_scale = 200.0  # Higher scale to emphasize importance
+        
         for i in range(self.n_drones):
             dist = point_to_segment_dist(self.drone_pos[i], self.fire_line[0], self.fire_line[1])
-            # Exponential reward for proximity to fire (very steep, but zero if touching)
-            if dist > min_dist:
-                exp_reward = proximity_scale * np.exp(-alpha * (dist - min_dist))
-                rewards[i] += exp_reward
-            else:
-                rewards[i] = 0  # much larger penalty for fire collision
+            
+            if dist <= collision_dist:
+                # Hard collision - terminal state
+                rewards[i] = -200
                 dones[i] = True
+            elif dist <= min_safe_dist:
+                # Danger zone - steep penalty but not terminal, encouraging learning
+                danger_factor = (min_safe_dist - dist) / (min_safe_dist - collision_dist)
+                rewards[i] += -50 * (danger_factor ** 2)  # Quadratic penalty in danger zone
+            else:
+                # Safe zone - exponential reward for proximity
+                safe_distance = dist - min_safe_dist
+                exp_reward = proximity_scale * np.exp(-alpha * safe_distance)
+                rewards[i] += exp_reward
+                
+                # Additional bonus for being in optimal range (just outside safety margin)
+                optimal_range = 0.3  # Distance beyond safety margin that's considered optimal
+                if safe_distance <= optimal_range:
+                    optimal_bonus = 100 * (1 - safe_distance / optimal_range)
+                    rewards[i] += optimal_bonus
+        
         # Drone-drone collision
         if np.linalg.norm(self.drone_pos[0] - self.drone_pos[1]) < 2*self.drone_radius + self.safety_margin:
-            rewards = [-10, -10]
+            rewards = [-50, -50]  # Reduced penalty to encourage learning
             dones = [True, True]
-        # Exploration reward (regenerating tile reward)
+        
+        # Exploration reward (reduced impact)
         grid_size = self.grid_size
         grid_dim = self.grid_dim
         max_reward = self.max_cell_reward
@@ -146,11 +169,12 @@ class DroneEnv(gym.Env):
                     cy = gy * grid_size + grid_size/2
                     if np.linalg.norm(drone_xy - np.array([cx, cy])) <= view_radius:
                         seen_mask[gx, gy] = True
-        # Give reward for seen cells, reset their reward to 0
+        # Give reduced reward for seen cells, reset their reward to 0
+        exploration_scale = 0.5  # Reduced impact of exploration
         for gx in range(grid_dim):
             for gy in range(grid_dim):
                 if seen_mask[gx, gy]:
-                    reward = self.cell_rewards[gx, gy]
+                    reward = self.cell_rewards[gx, gy] * exploration_scale
                     if reward > 0:
                         for i in range(self.n_drones):
                             rewards[i] += reward
@@ -159,17 +183,20 @@ class DroneEnv(gym.Env):
                     # Regenerate reward for unseen cells
                     if self.cell_rewards[gx, gy] < max_reward:
                         self.cell_rewards[gx, gy] = min(max_reward, self.cell_rewards[gx, gy] + regen_rate)
-        # Negative reward for proximity to edges/corners
-        edge_penalty_scale = 200.0  # much higher penalty
-        edge_penalty_alpha = 4.0    # much sharper penalty curve
+        
+        # Reduced edge penalty to not interfere with fire proximity
+        edge_penalty_scale = 50.0  # Much lower penalty
+        edge_penalty_alpha = 2.0   # Less steep penalty curve
         for i in range(self.n_drones):
             pos = self.drone_pos[i]
             # Distance to each wall (x=0, x=max, y=0, y=max, z=5, z=10)
             dists = [pos[0], self.area_size - pos[0], pos[1], self.area_size - pos[1], pos[2] - 5, 10 - pos[2]]
             min_dist = min(dists)
-            # Exponential penalty as drone approaches any wall/corner
-            edge_penalty = edge_penalty_scale * np.exp(-edge_penalty_alpha * min_dist)
-            rewards[i] -= edge_penalty
+            # Only apply edge penalty when very close to walls
+            if min_dist < 1.0:  # Only within 1 unit of walls
+                edge_penalty = edge_penalty_scale * np.exp(-edge_penalty_alpha * min_dist)
+                rewards[i] -= edge_penalty
+        
         self.done = dones
         return self._get_obs(), rewards, dones, False, {}
 
@@ -294,7 +321,7 @@ class TD3Agent:
     def decay_noise(self, decay_rate=0.99, min_noise=0.01):
         """Decay the noise levels by decay_rate, not going below min_noise."""
         self.noise_levels = [max(n * decay_rate, min_noise) for n in self.noise_levels]
-    def __init__(self, area_size, drone_radius, fire_line, fire_radius, safety_margin, max_step_size, obs_dim=7, act_dim=3, n_critics=2, n_candidates=10, noise_levels=[0.1,0.2,0.3], gamma=0.95, tau=0.005, policy_noise=0.1, noise_clip=0.2, policy_delay=2, buffer_size=100000, batch_size=128):
+    def __init__(self, area_size, drone_radius, fire_line, fire_radius, safety_margin, max_step_size, obs_dim=7, act_dim=3, n_critics=2, n_candidates=20, noise_levels=[0.05,0.1,0.15,0.25], gamma=0.95, tau=0.005, policy_noise=0.1, noise_clip=0.2, policy_delay=2, buffer_size=100000, batch_size=128):
         self.area_size = area_size
         self.drone_radius = drone_radius
         self.fire_line = np.array(fire_line)
@@ -326,17 +353,71 @@ class TD3Agent:
         obs = torch.tensor(obs_np, dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():
             base_action = self.actor(obs).cpu().numpy()[0]
+        
+        # Enhanced candidate generation for fire-line following
         candidates = []
+        
+        # 1. Base policy action (no noise)
+        candidates.append(base_action)
+        
+        # 2. Random noise variations
         for noise in self.noise_levels:
-            for _ in range(self.n_candidates):
+            for _ in range(self.n_candidates // len(self.noise_levels)):
                 perturbed = base_action + np.random.normal(0, noise, size=self.act_dim)
                 perturbed = np.clip(perturbed, -1, 1)
                 candidates.append(perturbed)
-        # aPE2: For each candidate, simulate step and get immediate reward, then get Q value
+        
+        # 3. Fire-directed actions (biased towards fire line)
+        current_pos = obs_np[:3]
+        fire_start, fire_end = self.fire_line[0], self.fire_line[1]
+        
+        # Find closest point on fire line to current position
+        def point_to_segment_dist_and_closest(p, a, b):
+            ap = p - a
+            ab = b - a
+            t = np.dot(ap, ab) / (np.dot(ab, ab) + 1e-8)
+            t = np.clip(t, 0, 1)
+            closest = a + t * ab
+            return np.linalg.norm(p - closest), closest
+        
+        dist_to_fire, closest_fire_point = point_to_segment_dist_and_closest(current_pos, fire_start, fire_end)
+        
+        # Generate actions that move towards optimal distance from fire
+        min_safe_dist = self.drone_radius + self.fire_radius + self.safety_margin
+        optimal_dist = min_safe_dist + 0.15  # Slightly outside safety margin
+        
+        if dist_to_fire > optimal_dist + 0.5:
+            # Too far - move towards fire
+            direction_to_fire = closest_fire_point - current_pos
+            direction_to_fire = direction_to_fire / (np.linalg.norm(direction_to_fire) + 1e-8)
+            for intensity in [0.3, 0.6, 0.9]:
+                fire_action = direction_to_fire * intensity
+                fire_action = np.clip(fire_action, -1, 1)
+                candidates.append(fire_action)
+        elif dist_to_fire < min_safe_dist + 0.1:
+            # Too close - move away from fire
+            direction_away = current_pos - closest_fire_point
+            direction_away = direction_away / (np.linalg.norm(direction_away) + 1e-8)
+            for intensity in [0.4, 0.7, 1.0]:
+                away_action = direction_away * intensity
+                away_action = np.clip(away_action, -1, 1)
+                candidates.append(away_action)
+        else:
+            # Good distance - move parallel to fire line
+            fire_direction = fire_end - fire_start
+            fire_direction = fire_direction / (np.linalg.norm(fire_direction) + 1e-8)
+            for direction in [1, -1]:  # Both directions along fire line
+                for intensity in [0.3, 0.6]:
+                    parallel_action = fire_direction * direction * intensity
+                    parallel_action = np.clip(parallel_action, -1, 1)
+                    candidates.append(parallel_action)
+        
+        # Enhanced scoring with more sophisticated reward prediction
         scores = []
         for a in candidates:
             # Simulate next state (only position part)
-            sim_pos = np.clip(obs_np[:3] + a * self.max_step_size, 0, self.area_size)
+            sim_pos = np.clip(obs_np[:3] + a * self.max_step_size, [0, 0, 5], [self.area_size, self.area_size, 10])
+            
             # Compute fire_below for simulated pos
             def point_to_segment_dist(p, a, b):
                 ap = p - a
@@ -345,25 +426,46 @@ class TD3Agent:
                 t = np.clip(t, 0, 1)
                 closest = a + t * ab
                 return np.linalg.norm(p - closest)
+            
             drone_xy0 = np.array([sim_pos[0], sim_pos[1], 0.0])
             fire_a = np.array([self.fire_line[0][0], self.fire_line[0][1], 0.0])
             fire_b = np.array([self.fire_line[1][0], self.fire_line[1][1], 0.0])
             dist_below = point_to_segment_dist(drone_xy0, fire_a, fire_b)
             fire_below = 1.0 if dist_below <= (self.fire_radius + 2) else 0.0
             sim_obs = np.concatenate([sim_pos, [fire_below], obs_np[4:7]])
-            # Immediate reward (simulate collision)
+            
+            # Simulate immediate reward using the new reward function
             dist = point_to_segment_dist(sim_pos, self.fire_line[0], self.fire_line[1])
-            min_dist = self.drone_radius + self.fire_radius + self.safety_margin
-            collision = dist <= min_dist
-            immediate_reward = -100 if collision else 10
+            min_safe_dist = self.drone_radius + self.fire_radius + self.safety_margin
+            collision_dist = self.drone_radius + self.fire_radius
+            
+            if dist <= collision_dist:
+                immediate_reward = -200
+            elif dist <= min_safe_dist:
+                danger_factor = (min_safe_dist - dist) / (min_safe_dist - collision_dist)
+                immediate_reward = -50 * (danger_factor ** 2)
+            else:
+                safe_distance = dist - min_safe_dist
+                alpha = 1.2
+                proximity_scale = 200.0
+                immediate_reward = proximity_scale * np.exp(-alpha * safe_distance)
+                
+                # Add optimal range bonus
+                optimal_range = 0.3
+                if safe_distance <= optimal_range:
+                    optimal_bonus = 100 * (1 - safe_distance / optimal_range)
+                    immediate_reward += optimal_bonus
+            
             # Long-term Q (average over critics)
             obs_t = torch.tensor(sim_obs, dtype=torch.float32).unsqueeze(0)
             act_t = torch.tensor(a, dtype=torch.float32).unsqueeze(0)
             q_vals = [critic(obs_t, act_t).item() for critic in self.critics]
             avg_q = np.mean(q_vals)
+            
             # Weighted score: immediate + gamma * avg_q
             score = immediate_reward + self.gamma * avg_q
             scores.append(score)
+        
         best_idx = int(np.argmax(scores))
         return candidates[best_idx]
     def store(self, o, a, r, no, d):
@@ -404,86 +506,185 @@ class TD3Agent:
 
 # --- MAIN LOOP ---
 def main():
-    num_episodes = 10
-    env = DroneEnv()
-    obs_dim = env.observation_space.shape[1]
-    act_dim = env.action_space.shape[1]
-    agents = [TD3Agent(
-        area_size=env.area_size,
-        drone_radius=env.drone_radius,
-        fire_line=env.fire_line,
-        fire_radius=env.fire_radius,
-        safety_margin=env.safety_margin,
-        max_step_size=env.max_step_size,
-        obs_dim=obs_dim,
-        act_dim=act_dim
-    ) for _ in range(env.n_drones)]
+    num_episodes = 50  # Increased for curriculum learning
+    curriculum_episodes = 5  # Episodes per curriculum level
+    
     episode_rewards = [[], []]  # Store total points per episode for each drone
-    for episode in range(num_episodes):
-        obs, _ = env.reset()
-        done = [False, False]
-        total_reward = [0, 0]
-        steps = 0
-        crash_type = [None, None]  # Track crash reason for each drone
-        # Track seen areas for each drone (list of (x, y, radius))
-        seen_areas = [[], []]
-        # Track seen grid cells for exploration reward
-        seen_grids = [set(), set()]
-        # Wait for user input before visualizing the last episode
-        if episode == num_episodes - 1:
-            input("Press Enter to play the last episode...")
-        while not all(done) and steps < 100:
-            actions = np.zeros((env.n_drones, 3))
+    avg_fire_distances = [[], []]  # Track average distance to fire per episode
+    
+    for curriculum_level in range(5):  # 5 curriculum levels
+        print(f"\n=== CURRICULUM LEVEL {curriculum_level + 1}/5 ===")
+        
+        env = DroneEnv(curriculum_level=curriculum_level)
+        obs_dim = env.observation_space.shape[1]
+        act_dim = env.action_space.shape[1]
+        agents = [TD3Agent(
+            area_size=env.area_size,
+            drone_radius=env.drone_radius,
+            fire_line=env.fire_line,
+            fire_radius=env.fire_radius,
+            safety_margin=env.safety_margin,
+            max_step_size=env.max_step_size,
+            obs_dim=obs_dim,
+            act_dim=act_dim
+        ) for _ in range(env.n_drones)]
+        
+        print(f"Safety margin for this level: {env.safety_margin:.2f}")
+        
+        for episode in range(curriculum_episodes):
+            obs, _ = env.reset()
+            done = [False, False]
+            total_reward = [0, 0]
+            fire_distances = [[], []]  # Track fire distances during episode
+            steps = 0
+            crash_type = [None, None]  # Track crash reason for each drone
+            
+            # Track seen areas for each drone (list of (x, y, radius))
+            seen_areas = [[], []]
+            # Track seen grid cells for exploration reward
+            seen_grids = [set(), set()]
+            
+            # Wait for user input before visualizing the last episode of the last curriculum level
+            if curriculum_level == 4 and episode == curriculum_episodes - 1:
+                input("Press Enter to play the final episode...")
+            
+            while not all(done) and steps < 150:  # Increased step limit
+                actions = np.zeros((env.n_drones, 3))
+                for i in range(env.n_drones):
+                    if not done[i]:
+                        actions[i] = agents[i].select_action(obs[i])
+                
+                next_obs, rewards, done, _, _ = env.step(actions, seen_grids=seen_grids)
+                
+                # Track fire distances
+                def point_to_segment_dist(p, a, b):
+                    ap = p - a
+                    ab = b - a
+                    t = np.dot(ap, ab) / (np.dot(ab, ab) + 1e-8)
+                    t = np.clip(t, 0, 1)
+                    closest = a + t * ab
+                    return np.linalg.norm(p - closest)
+                
+                for i in range(env.n_drones):
+                    if not done[i]:
+                        dist_to_fire = point_to_segment_dist(next_obs[i][:3], env.fire_line[0], env.fire_line[1])
+                        fire_distances[i].append(dist_to_fire)
+                
+                # Record seen area for each drone
+                k = 1.0  # must match _get_obs and render
+                for i in range(env.n_drones):
+                    pos = next_obs[i]
+                    drone_xy = np.array([pos[0], pos[1]])
+                    z = pos[2]
+                    view_radius = k * z / 4
+                    seen_areas[i].append((drone_xy[0], drone_xy[1], view_radius))
+                
+                for i in range(env.n_drones):
+                    agents[i].store(obs[i], actions[i], rewards[i], next_obs[i], float(done[i]))
+                    agents[i].train()
+                    total_reward[i] += rewards[i]
+                    # Detect crash type
+                    if done[i] and crash_type[i] is None:
+                        if rewards[i] <= -100:  # Large negative reward indicates crash
+                            # Check if crashed into fire or other drone
+                            if done[0] and done[1] and np.linalg.norm(next_obs[0][:3] - next_obs[1][:3]) < 2*env.drone_radius + env.safety_margin + 1e-3:
+                                crash_type[0] = crash_type[1] = 'drone-drone collision'
+                            else:
+                                crash_type[i] = 'fire collision'
+                
+                if curriculum_level == 4 and episode == curriculum_episodes - 1:
+                    # Calculate distances for display
+                    distances = []
+                    for i in range(env.n_drones):
+                        dist = point_to_segment_dist(next_obs[i][:3], env.fire_line[0], env.fire_line[1])
+                        distances.append(dist)
+                    print(f"Step {steps}: Drone positions {next_obs[:, :3].round(2)}, Fire distances {[round(d, 2) for d in distances]}, Rewards {[round(r, 1) for r in rewards]}, Done {done}")
+                    env.render()
+                
+                obs = next_obs
+                steps += 1
+            
+            # Calculate average fire distances for this episode
             for i in range(env.n_drones):
-                if not done[i]:
-                    actions[i] = agents[i].select_action(obs[i])
-            next_obs, rewards, done, _, _ = env.step(actions, seen_grids=seen_grids)
-            # Record seen area for each drone
-            k = 1.0  # must match _get_obs and render
+                if crash_type[i] is None and done[i]:
+                    crash_type[i] = 'timeout'
+                episode_rewards[i].append(total_reward[i])
+                if fire_distances[i]:
+                    avg_fire_distances[i].append(np.mean(fire_distances[i]))
+                else:
+                    avg_fire_distances[i].append(float('inf'))  # No distance recorded
+            
+            global_episode = curriculum_level * curriculum_episodes + episode + 1
+            print(f"Episode {global_episode}/{num_episodes} (Level {curriculum_level+1}) Total Rewards: {[round(r, 1) for r in total_reward]}")
             for i in range(env.n_drones):
-                pos = next_obs[i]
-                drone_xy = np.array([pos[0], pos[1]])
-                z = pos[2]
-                view_radius = k * z / 4
-                seen_areas[i].append((drone_xy[0], drone_xy[1], view_radius))
-            for i in range(env.n_drones):
-                agents[i].store(obs[i], actions[i], rewards[i], next_obs[i], float(done[i]))
-                agents[i].train()
-                total_reward[i] += rewards[i]
-                # Detect crash type
-                if done[i] and crash_type[i] is None:
-                    if rewards[i] == -10:
-                        # Check if crashed into fire or other drone
-                        if done[0] and done[1] and rewards[0] == -10 and rewards[1] == -10 and np.linalg.norm(next_obs[0][:3] - next_obs[1][:3]) < 2*env.drone_radius + env.safety_margin + 1e-3:
-                            crash_type[0] = crash_type[1] = 'drone-drone collision'
-                        else:
-                            crash_type[i] = 'fire collision'
-                            total_reward[i] = 0  # Immediately set points to zero on fire collisio
-            if episode == num_episodes - 1:
-                print(f"Step {steps}: Drone positions {next_obs[:, :3].round(2)}, Rewards {rewards}, Done {done}")
-                env.render()
-            obs = next_obs
-            steps += 1
-        for i in range(env.n_drones):
-            if crash_type[i] is None and done[i]:
-                crash_type[i] = 'other (timeout or unknown)'
-            episode_rewards[i].append(total_reward[i])
-        print(f"Episode {episode+1}/{num_episodes} Total Rewards: {total_reward}")
-        for i in range(env.n_drones):
-            print(f"  Drone {i+1}: Total Points = {total_reward[i]}, Ended by: {crash_type[i]}")
-        # Decay noise for all agents after each episode
-        for agent in agents:
-            agent.decay_noise()
+                avg_dist = avg_fire_distances[i][-1] if avg_fire_distances[i] else float('inf')
+                print(f"  Drone {i+1}: Total Points = {total_reward[i]:.1f}, Avg Fire Distance = {avg_dist:.2f}, Ended by: {crash_type[i]}")
+            
+            # Decay noise for all agents after each episode
+            for agent in agents:
+                agent.decay_noise()
+    
     # Remove non-blocking show here to avoid closing the stats plot
     # Plot total points per episode for each drone
     plt.ioff()  # Disable interactive mode for the stats plot
-    plt.figure()
-    plt.plot(episode_rewards[0], label='Drone 1')
-    plt.plot(episode_rewards[1], label='Drone 2')
+    plt.figure(figsize=(15, 5))
+    
+    # Subplot 1: Total rewards
+    plt.subplot(1, 3, 1)
+    plt.plot(episode_rewards[0], label='Drone 1', alpha=0.7)
+    plt.plot(episode_rewards[1], label='Drone 2', alpha=0.7)
+    # Add vertical lines for curriculum level changes
+    for i in range(1, 5):
+        plt.axvline(x=i*curriculum_episodes, color='red', linestyle='--', alpha=0.5)
     plt.xlabel('Episode')
     plt.ylabel('Total Points')
     plt.title('Total Points per Episode')
     plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Subplot 2: Average fire distances
+    plt.subplot(1, 3, 2)
+    # Filter out infinite values for plotting
+    dist1_filtered = [d for d in avg_fire_distances[0] if d != float('inf')]
+    dist2_filtered = [d for d in avg_fire_distances[1] if d != float('inf')]
+    plt.plot(range(len(dist1_filtered)), dist1_filtered, label='Drone 1', alpha=0.7)
+    plt.plot(range(len(dist2_filtered)), dist2_filtered, label='Drone 2', alpha=0.7)
+    # Add horizontal line for optimal distance
+    optimal_dist = env.drone_radius + env.fire_radius + env.base_safety_margin + 0.15
+    plt.axhline(y=optimal_dist, color='green', linestyle=':', label=f'Optimal Distance ({optimal_dist:.2f})')
+    # Add vertical lines for curriculum level changes
+    for i in range(1, 5):
+        plt.axvline(x=i*curriculum_episodes, color='red', linestyle='--', alpha=0.5)
+    plt.xlabel('Episode')
+    plt.ylabel('Average Distance to Fire')
+    plt.title('Average Fire Distance per Episode')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Subplot 3: Combined performance metric
+    plt.subplot(1, 3, 3)
+    # Calculate a combined score: high reward + low distance = good performance
+    combined_scores = []
+    for i in range(len(episode_rewards[0])):
+        reward_norm = (episode_rewards[0][i] + episode_rewards[1][i]) / 2  # Average reward
+        if i < len(avg_fire_distances[0]) and avg_fire_distances[0][i] != float('inf'):
+            dist_penalty = max(0, avg_fire_distances[0][i] - optimal_dist) * 50  # Penalty for being too far
+            combined_score = reward_norm - dist_penalty
+        else:
+            combined_score = reward_norm - 100  # High penalty for crashes
+        combined_scores.append(combined_score)
+    
+    plt.plot(combined_scores, color='purple', linewidth=2, label='Combined Performance')
+    # Add vertical lines for curriculum level changes
+    for i in range(1, 5):
+        plt.axvline(x=i*curriculum_episodes, color='red', linestyle='--', alpha=0.5)
+    plt.xlabel('Episode')
+    plt.ylabel('Combined Performance Score')
+    plt.title('Combined Performance (Reward - Distance Penalty)')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
     plt.show()  # Blocking show for the stats plot
 
     # Plot union of all seen areas for each drone (last episode)
@@ -526,13 +727,13 @@ def main():
     fire_line = env.fire_line
     fire_radius = env.fire_radius
     drone_radius = env.drone_radius
-    safety_margin = env.safety_margin
+    safety_margin = env.base_safety_margin  # Use base safety margin for analysis
     max_cell_reward = env.max_cell_reward
     cell_rewards = env.cell_rewards
-    alpha = 0.7  # fire proximity exponential (more gradual)
-    proximity_scale = 100.0
-    edge_penalty_scale = 200.0
-    edge_penalty_alpha = 4.0
+    alpha = 1.2  # Updated to match new parameters
+    proximity_scale = 200.0
+    edge_penalty_scale = 50.0
+    edge_penalty_alpha = 2.0
     z = 7.5  # fixed height for analysis
     integrated_reward = np.zeros((grid_dim, grid_dim))
     def point_to_segment_dist(p, a, b):
@@ -549,22 +750,35 @@ def main():
             pos = np.array([cx, cy, z])
             # Proximity to fire
             dist_fire = point_to_segment_dist(pos, fire_line[0], fire_line[1])
-            min_dist_fire = drone_radius + fire_radius + safety_margin
-            if dist_fire > min_dist_fire:
-                fire_reward = proximity_scale * np.exp(-alpha * (dist_fire - min_dist_fire))
+            min_safe_dist = drone_radius + fire_radius + safety_margin
+            collision_dist = drone_radius + fire_radius
+            if dist_fire <= collision_dist:
+                fire_reward = -200
+            elif dist_fire <= min_safe_dist:
+                danger_factor = (min_safe_dist - dist_fire) / (min_safe_dist - collision_dist)
+                fire_reward = -50 * (danger_factor ** 2)
             else:
-                fire_reward = -100  # collision penalty
-            # Edge penalty
+                safe_distance = dist_fire - min_safe_dist
+                fire_reward = proximity_scale * np.exp(-alpha * safe_distance)
+                # Add optimal range bonus
+                optimal_range = 0.3
+                if safe_distance <= optimal_range:
+                    optimal_bonus = 100 * (1 - safe_distance / optimal_range)
+                    fire_reward += optimal_bonus
+            # Edge penalty (only when very close)
             dists = [pos[0], area_size - pos[0], pos[1], area_size - pos[1], pos[2] - 5, 10 - pos[2]]
             min_dist_edge = min(dists)
-            edge_penalty = edge_penalty_scale * np.exp(-edge_penalty_alpha * min_dist_edge)
-            # Exploration reward
-            exploration_reward = cell_rewards[gx, gy]
+            if min_dist_edge < 1.0:
+                edge_penalty = edge_penalty_scale * np.exp(-edge_penalty_alpha * min_dist_edge)
+            else:
+                edge_penalty = 0
+            # Exploration reward (reduced impact)
+            exploration_reward = cell_rewards[gx, gy] * 0.5
             # Total
             integrated_reward[gx, gy] = fire_reward - edge_penalty + exploration_reward
     plt.figure(figsize=(6, 5))
     plt.imshow(integrated_reward.T, origin='lower', cmap='coolwarm')
-    plt.title('Integrated Reward System Heatmap')
+    plt.title('Integrated Reward System Heatmap (Final Level)')
     plt.xlabel('Grid X')
     plt.ylabel('Grid Y')
     plt.colorbar(label='Total Reward Value')
