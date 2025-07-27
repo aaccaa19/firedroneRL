@@ -8,7 +8,7 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 # --- ENVIRONMENT ---
 class DroneEnv(gym.Env):
-    def __init__(self, area_size=10, drone_radius=0.5, fire_line=((5,5,0),(5,5,10)), fire_radius=0.5, safety_margin=0.2, max_step_size=0.5, curriculum_level=0):
+    def __init__(self, area_size=10, drone_radius=0.5, fire_line=((5,5,0),(5,5,10)), fire_radius=0.5, safety_margin=0.2, max_step_size=0.5, curriculum_level=0, scenario=1):
         super().__init__()
         self.area_size = area_size
         self.drone_radius = drone_radius
@@ -20,6 +20,14 @@ class DroneEnv(gym.Env):
         self.safety_margin = safety_margin + max(0, (5 - curriculum_level) * 0.1)
         self.max_step_size = max_step_size
         self.n_drones = 2
+        self.scenario = scenario
+        # For scenario 2: fire spread state
+        if scenario == 2:
+            self.fire_centers = [np.mean(self.fire_line, axis=0)]  # List of fire centers
+            self.fire_radius = fire_radius
+            self.fire_spread_rate = 0.5  # Not used, but kept for compatibility
+            self.fire_spawn_radius = 2.0  # New fires spawn within this radius from any fire
+            self.max_fires = 20  # Limit number of fires for performance
         self.action_space = spaces.Box(low=-1, high=1, shape=(self.n_drones,3), dtype=np.float32)
         # Each drone: [x, y, z, fire_below, other_x, other_y, other_z]
         low = np.array([0,0,0,0,0,0,0]*self.n_drones).reshape((self.n_drones,7))
@@ -64,6 +72,8 @@ class DroneEnv(gym.Env):
         self.drone_pos = np.stack([pos1, pos2])
         self.done = [False, False]
         self.cell_rewards = np.full((self.grid_dim, self.grid_dim), self.max_cell_reward, dtype=np.int32)  # Reset cell rewards to max
+        if self.scenario == 2:
+            self.fire_centers = [np.mean(self.fire_line, axis=0)]
         return self._get_obs(), {}
 
     def _get_obs(self):
@@ -103,6 +113,24 @@ class DroneEnv(gym.Env):
             a = a / (np.linalg.norm(a) + 1e-8) * min(np.linalg.norm(a), 1.0)
             a = a * self.max_step_size
             self.drone_pos[i] = np.clip(self.drone_pos[i] + a, [0, 0, 5], [self.area_size, self.area_size, 10])
+        # Scenario 2: fire spreads each step
+        if self.scenario == 2:
+            # With some probability, add a new fire near an existing fire
+            if len(self.fire_centers) < self.max_fires:
+                for center in list(self.fire_centers):
+                    if np.random.rand() < 0.01:  # 3% chance per fire per step
+                        angle = np.random.uniform(0, 2 * np.pi)
+                        height = np.random.uniform(-2, 2)
+                        r = np.random.uniform(0.5, self.fire_spawn_radius)
+                        dx = r * np.cos(angle)
+                        dy = r * np.sin(angle)
+                        dz = height
+                        new_center = center + np.array([dx, dy, dz])
+                        # Keep within bounds
+                        new_center = np.clip(new_center, [0, 0, 5], [self.area_size, self.area_size, 10])
+                        # Only add if not too close to existing fires
+                        if all(np.linalg.norm(new_center - fc) > self.fire_radius * 1.5 for fc in self.fire_centers):
+                            self.fire_centers.append(new_center)
         # Check collisions
         def point_to_segment_dist(p, a, b):
             ap = p - a
@@ -120,22 +148,29 @@ class DroneEnv(gym.Env):
         proximity_scale = 200.0  # Higher scale to emphasize importance
         
         for i in range(self.n_drones):
-            dist = point_to_segment_dist(self.drone_pos[i], self.fire_line[0], self.fire_line[1])
-            
-            if dist <= collision_dist:
+            if self.scenario == 2:
+                # Find closest fire center
+                dists = [np.linalg.norm(self.drone_pos[i] - fc) for fc in self.fire_centers]
+                min_dist = min(dists)
+                collision_dist = self.drone_radius + self.fire_radius
+                min_safe_dist = self.drone_radius + self.fire_radius + self.safety_margin
+            else:
+                min_dist = point_to_segment_dist(self.drone_pos[i], self.fire_line[0], self.fire_line[1])
+                collision_dist = self.drone_radius + self.fire_radius
+                min_safe_dist = self.drone_radius + self.fire_radius + self.safety_margin
+            if min_dist <= collision_dist:
                 # Hard collision - terminal state
                 rewards[i] = -200
                 dones[i] = True
-            elif dist <= min_safe_dist:
+            elif min_dist <= min_safe_dist:
                 # Danger zone - steep penalty but not terminal, encouraging learning
-                danger_factor = (min_safe_dist - dist) / (min_safe_dist - collision_dist)
+                danger_factor = (min_safe_dist - min_dist) / (min_safe_dist - collision_dist)
                 rewards[i] += -50 * (danger_factor ** 2)  # Quadratic penalty in danger zone
             else:
                 # Safe zone - exponential reward for proximity
-                safe_distance = dist - min_safe_dist
+                safe_distance = min_dist - min_safe_dist
                 exp_reward = proximity_scale * np.exp(-alpha * safe_distance)
                 rewards[i] += exp_reward
-                
                 # Additional bonus for being in optimal range (just outside safety margin)
                 optimal_range = 0.3  # Distance beyond safety margin that's considered optimal
                 if safe_distance <= optimal_range:
@@ -200,7 +235,7 @@ class DroneEnv(gym.Env):
         self.done = dones
         return self._get_obs(), rewards, dones, False, {}
 
-    def render(self):
+    def render(self, drone_pos=None, fire_centers=None):
         # 3D visualization using matplotlib
         fig = plt.figure(1)
         plt.clf()
@@ -208,19 +243,48 @@ class DroneEnv(gym.Env):
         ax.set_xlim([0, self.area_size])
         ax.set_ylim([0, self.area_size])
         ax.set_zlim([0, self.area_size])
-        # Draw fire line
-        p1, p2 = self.fire_line
-        ax.plot([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]], color='r', linewidth=4, label='Fire Line')
+        # Draw fire line or fires
+        if self.scenario == 2:
+            # Draw all fire centers as vertical cylinders attached to the floor
+            fire_height = self.area_size  # Cylinder height (floor to ceiling)
+            n_cylinder = 24
+            for fc in (fire_centers if fire_centers is not None else self.fire_centers):
+                # Cylinder base center at (fc[0], fc[1], 0), top at (fc[0], fc[1], fire_height)
+                theta = np.linspace(0, 2 * np.pi, n_cylinder)
+                x = fc[0] + self.fire_radius * np.cos(theta)
+                y = fc[1] + self.fire_radius * np.sin(theta)
+                z_bottom = np.zeros_like(theta)
+                z_top = np.full_like(theta, fire_height)
+                # Draw side faces
+                for i in range(n_cylinder - 1):
+                    verts = [
+                        [x[i], y[i], 0],
+                        [x[i+1], y[i+1], 0],
+                        [x[i+1], y[i+1], fire_height],
+                        [x[i], y[i], fire_height]
+                    ]
+                    poly = Poly3DCollection([verts], color='red', alpha=0.4)
+                    ax.add_collection3d(poly)
+                # Draw top and bottom faces
+                verts_top = list(zip(x, y, z_top))
+                verts_bottom = list(zip(x, y, z_bottom))
+                poly_top = Poly3DCollection([verts_top], color='red', alpha=0.4)
+                poly_bottom = Poly3DCollection([verts_bottom], color='red', alpha=0.4)
+                ax.add_collection3d(poly_top)
+                ax.add_collection3d(poly_bottom)
+        else:
+            p1, p2 = self.fire_line
+            ax.plot([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]], color='r', linewidth=4, label='Fire Line')
         # Draw drones as spheres
         u, v = np.mgrid[0:2*np.pi:20j, 0:np.pi:10j]
-        for pos in self.drone_pos:
+        for pos in (drone_pos if drone_pos is not None else self.drone_pos):
             x = pos[0] + self.drone_radius * np.cos(u) * np.sin(v)
             y = pos[1] + self.drone_radius * np.sin(u) * np.sin(v)
             z = pos[2] + self.drone_radius * np.cos(v)
             ax.plot_surface(x, y, z, color='b', alpha=0.5)
         # Draw cone base (field of view) for each drone
         k = 1.0  # must match _get_obs
-        for pos in self.drone_pos:
+        for pos in (drone_pos if drone_pos is not None else self.drone_pos):
             drone_xy = np.array([pos[0], pos[1]])
             z = pos[2]
             view_radius = k * z / 4  # decreased by 2
@@ -235,7 +299,7 @@ class DroneEnv(gym.Env):
             poly = Poly3DCollection(verts, color='orange', alpha=0.15)
             ax.add_collection3d(poly)
         # Draw safety AABB as transparent cubes (12 edges each)
-        for pos in self.drone_pos:
+        for pos in (drone_pos if drone_pos is not None else self.drone_pos):
             aabb_min = pos - (self.drone_radius + self.safety_margin)
             aabb_max = pos + (self.drone_radius + self.safety_margin)
             # 8 corners of the cube
@@ -259,7 +323,7 @@ class DroneEnv(gym.Env):
                 ax.plot([corners[s][0], corners[e][0]],
                         [corners[s][1], corners[e][1]],
                         [corners[s][2], corners[e][2]], color="g", alpha=0.3)
-        ax.set_title(f"Drone positions: {self.drone_pos.round(2)}")
+        ax.set_title(f"Drone positions: {np.array(drone_pos if drone_pos is not None else self.drone_pos).round(2)}")
         plt.draw()
         plt.pause(0.01)
 
@@ -506,123 +570,149 @@ class TD3Agent:
 
 # --- MAIN LOOP ---
 def main():
-    num_episodes = 50  # Increased for curriculum learning
-    curriculum_episodes = 5  # Episodes per curriculum level
-    
+    scenarios = [1, 2]
+    scenario_names = {1: "Static Fire Line", 2: "Spreading Fire"}
+    num_scenarios = len(scenarios)
+    num_episodes = 5  # Total episodes per scenario
+    curriculum_episodes = 1  # Episodes per curriculum level
+
     episode_rewards = [[], []]  # Store total points per episode for each drone
     avg_fire_distances = [[], []]  # Track average distance to fire per episode
-    
-    for curriculum_level in range(5):  # 5 curriculum levels
-        print(f"\n=== CURRICULUM LEVEL {curriculum_level + 1}/5 ===")
-        
-        env = DroneEnv(curriculum_level=curriculum_level)
-        obs_dim = env.observation_space.shape[1]
-        act_dim = env.action_space.shape[1]
-        agents = [TD3Agent(
-            area_size=env.area_size,
-            drone_radius=env.drone_radius,
-            fire_line=env.fire_line,
-            fire_radius=env.fire_radius,
-            safety_margin=env.safety_margin,
-            max_step_size=env.max_step_size,
-            obs_dim=obs_dim,
-            act_dim=act_dim
-        ) for _ in range(env.n_drones)]
-        
-        print(f"Safety margin for this level: {env.safety_margin:.2f}")
-        
-        for episode in range(curriculum_episodes):
-            obs, _ = env.reset()
-            done = [False, False]
-            total_reward = [0, 0]
-            fire_distances = [[], []]  # Track fire distances during episode
-            steps = 0
-            crash_type = [None, None]  # Track crash reason for each drone
-            
-            # Track seen areas for each drone (list of (x, y, radius))
-            seen_areas = [[], []]
-            # Track seen grid cells for exploration reward
-            seen_grids = [set(), set()]
-            
-            # Wait for user input before visualizing the last episode of the last curriculum level
-            if curriculum_level == 4 and episode == curriculum_episodes - 1:
-                input("Press Enter to play the final episode...")
-            
-            while not all(done) and steps < 150:  # Increased step limit
-                actions = np.zeros((env.n_drones, 3))
-                for i in range(env.n_drones):
-                    if not done[i]:
-                        actions[i] = agents[i].select_action(obs[i])
-                
-                next_obs, rewards, done, _, _ = env.step(actions, seen_grids=seen_grids)
-                
-                # Track fire distances
-                def point_to_segment_dist(p, a, b):
-                    ap = p - a
-                    ab = b - a
-                    t = np.dot(ap, ab) / (np.dot(ab, ab) + 1e-8)
-                    t = np.clip(t, 0, 1)
-                    closest = a + t * ab
-                    return np.linalg.norm(p - closest)
-                
-                for i in range(env.n_drones):
-                    if not done[i]:
-                        dist_to_fire = point_to_segment_dist(next_obs[i][:3], env.fire_line[0], env.fire_line[1])
-                        fire_distances[i].append(dist_to_fire)
-                
-                # Record seen area for each drone
-                k = 1.0  # must match _get_obs and render
-                for i in range(env.n_drones):
-                    pos = next_obs[i]
-                    drone_xy = np.array([pos[0], pos[1]])
-                    z = pos[2]
-                    view_radius = k * z / 4
-                    seen_areas[i].append((drone_xy[0], drone_xy[1], view_radius))
-                
-                for i in range(env.n_drones):
-                    agents[i].store(obs[i], actions[i], rewards[i], next_obs[i], float(done[i]))
-                    agents[i].train()
-                    total_reward[i] += rewards[i]
-                    # Detect crash type
-                    if done[i] and crash_type[i] is None:
-                        if rewards[i] <= -100:  # Large negative reward indicates crash
-                            # Check if crashed into fire or other drone
-                            if done[0] and done[1] and np.linalg.norm(next_obs[0][:3] - next_obs[1][:3]) < 2*env.drone_radius + env.safety_margin + 1e-3:
-                                crash_type[0] = crash_type[1] = 'drone-drone collision'
-                            else:
-                                crash_type[i] = 'fire collision'
-                
+
+    # Initialize agents ONCE so they retain learning across scenarios
+    env = DroneEnv(curriculum_level=0, scenario=1)
+    obs_dim = env.observation_space.shape[1]
+    act_dim = env.action_space.shape[1]
+    agents = [TD3Agent(
+        area_size=env.area_size,
+        drone_radius=env.drone_radius,
+        fire_line=env.fire_line,
+        fire_radius=env.fire_radius,
+        safety_margin=env.safety_margin,
+        max_step_size=env.max_step_size,
+        obs_dim=obs_dim,
+        act_dim=act_dim
+    ) for _ in range(env.n_drones)]
+
+    for scenario in scenarios:
+        print(f"\n=== SCENARIO {scenario}: {scenario_names[scenario]} ===")
+        for curriculum_level in range(5):  # 5 curriculum levels per scenario
+            print(f"  --- CURRICULUM LEVEL {curriculum_level + 1}/5 ---")
+            env = DroneEnv(curriculum_level=curriculum_level, scenario=scenario)
+            print(f"  Safety margin for this level: {env.safety_margin:.2f}")
+            for episode in range(curriculum_episodes):
+                obs, _ = env.reset()
+                done = [False, False]
+                total_reward = [0, 0]
+                fire_distances = [[], []]  # Track fire distances during episode
+                steps = 0
+                crash_type = [None, None]  # Track crash reason for each drone
+
+                # Track seen areas for each drone (list of (x, y, radius))
+                seen_areas = [[], []]
+                # Track seen grid cells for exploration reward
+                seen_grids = [set(), set()]
+
+                # Wait for user input before visualizing the last episode of the last curriculum level
                 if curriculum_level == 4 and episode == curriculum_episodes - 1:
-                    # Calculate distances for display
-                    distances = []
+                    input("Press Enter to play the final episode...")
+
+
+                # --- Store episode states for visualization ---
+                episode_states = []
+                episode_fire_centers = []
+                episode_rewards_per_step = []
+                episode_dones_per_step = []
+                rewards = [0, 0]  # Initialize rewards before first step
+
+                while not all(done) and steps < 150:
+                    actions = np.zeros((env.n_drones, 3))
                     for i in range(env.n_drones):
-                        dist = point_to_segment_dist(next_obs[i][:3], env.fire_line[0], env.fire_line[1])
-                        distances.append(dist)
-                    print(f"Step {steps}: Drone positions {next_obs[:, :3].round(2)}, Fire distances {[round(d, 2) for d in distances]}, Rewards {[round(r, 1) for r in rewards]}, Done {done}")
-                    env.render()
-                
-                obs = next_obs
-                steps += 1
-            
-            # Calculate average fire distances for this episode
-            for i in range(env.n_drones):
-                if crash_type[i] is None and done[i]:
-                    crash_type[i] = 'timeout'
-                episode_rewards[i].append(total_reward[i])
-                if fire_distances[i]:
-                    avg_fire_distances[i].append(np.mean(fire_distances[i]))
-                else:
-                    avg_fire_distances[i].append(float('inf'))  # No distance recorded
-            
-            global_episode = curriculum_level * curriculum_episodes + episode + 1
-            print(f"Episode {global_episode}/{num_episodes} (Level {curriculum_level+1}) Total Rewards: {[round(r, 1) for r in total_reward]}")
-            for i in range(env.n_drones):
-                avg_dist = avg_fire_distances[i][-1] if avg_fire_distances[i] else float('inf')
-                print(f"  Drone {i+1}: Total Points = {total_reward[i]:.1f}, Avg Fire Distance = {avg_dist:.2f}, Ended by: {crash_type[i]}")
-            
-            # Decay noise for all agents after each episode
-            for agent in agents:
-                agent.decay_noise()
+                        if not done[i]:
+                            actions[i] = agents[i].select_action(obs[i])
+
+                    # Store state before step for visualization
+                    episode_states.append(np.copy(obs[:, :3]))
+                    if env.scenario == 2:
+                        episode_fire_centers.append([fc.copy() for fc in env.fire_centers])
+                    else:
+                        episode_fire_centers.append(None)
+                    episode_rewards_per_step.append(list(rewards))
+                    episode_dones_per_step.append(list(done))
+
+                    next_obs, rewards, done, _, _ = env.step(actions, seen_grids=seen_grids)
+
+                    # Track fire distances
+                    def point_to_segment_dist(p, a, b):
+                        ap = p - a
+                        ab = b - a
+                        t = np.dot(ap, ab) / (np.dot(ab, ab) + 1e-8)
+                        t = np.clip(t, 0, 1)
+                        closest = a + t * ab
+                        return np.linalg.norm(p - closest)
+
+                    for i in range(env.n_drones):
+                        if not done[i]:
+                            if env.scenario == 2:
+                                # Closest fire center
+                                dists = [np.linalg.norm(next_obs[i][:3] - fc) for fc in env.fire_centers]
+                                dist_to_fire = min(dists)
+                            else:
+                                dist_to_fire = point_to_segment_dist(next_obs[i][:3], env.fire_line[0], env.fire_line[1])
+                            fire_distances[i].append(dist_to_fire)
+
+                    # Record seen area for each drone
+                    k = 1.0  # must match _get_obs and render
+                    for i in range(env.n_drones):
+                        pos = next_obs[i]
+                        drone_xy = np.array([pos[0], pos[1]])
+                        z = pos[2]
+                        view_radius = k * z / 4
+                        seen_areas[i].append((drone_xy[0], drone_xy[1], view_radius))
+
+                    for i in range(env.n_drones):
+                        agents[i].store(obs[i], actions[i], rewards[i], next_obs[i], float(done[i]))
+                        agents[i].train()
+                        total_reward[i] += rewards[i]
+                        # Detect crash type
+                        if done[i] and crash_type[i] is None:
+                            if rewards[i] <= -100:  # Large negative reward indicates crash
+                                # Check if crashed into fire or other drone
+                                if done[0] and done[1] and np.linalg.norm(next_obs[0][:3] - next_obs[1][:3]) < 2*env.drone_radius + env.safety_margin + 1e-3:
+                                    crash_type[0] = crash_type[1] = 'drone-drone collision'
+                                else:
+                                    crash_type[i] = 'fire collision'
+
+                    obs = next_obs
+                    steps += 1
+
+                # --- Play episode visualization after episode ends ---
+                if curriculum_level == 4 and episode == curriculum_episodes - 1:
+                    print("Playing episode visualization...")
+                    for t in range(len(episode_states)):
+                        print(f"Step {t}: Drone positions: {np.array(episode_states[t]).round(2)}")
+                    for t in range(len(episode_states)):
+                        env.render(drone_pos=episode_states[t], fire_centers=episode_fire_centers[t])
+
+                # Calculate average fire distances for this episode
+                for i in range(env.n_drones):
+                    if crash_type[i] is None and done[i]:
+                        crash_type[i] = 'timeout'
+                    episode_rewards[i].append(total_reward[i])
+                    if fire_distances[i]:
+                        avg_fire_distances[i].append(np.mean(fire_distances[i]))
+                    else:
+                        avg_fire_distances[i].append(float('inf'))  # No distance recorded
+
+                global_episode = (scenario - 1) * 5 * curriculum_episodes + curriculum_level * curriculum_episodes + episode + 1
+                print(f"Episode {global_episode}/{num_scenarios * 5 * curriculum_episodes} (Scenario {scenario}, Level {curriculum_level+1}) Total Rewards: {[round(r, 1) for r in total_reward]}")
+                for i in range(env.n_drones):
+                    avg_dist = avg_fire_distances[i][-1] if avg_fire_distances[i] else float('inf')
+                    print(f"  Drone {i+1}: Total Points = {total_reward[i]:.1f}, Avg Fire Distance = {avg_dist:.2f}, Ended by: {crash_type[i]}")
+
+                # Decay noise for all agents after each episode
+                for agent in agents:
+                    agent.decay_noise()
     
     # Remove non-blocking show here to avoid closing the stats plot
     # Plot total points per episode for each drone
