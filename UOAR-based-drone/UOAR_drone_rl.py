@@ -26,8 +26,17 @@ class DroneEnv(gym.Env):
             self.fire_centers = [np.mean(self.fire_line, axis=0)]  # List of fire centers
             self.fire_radius = fire_radius
             self.fire_spread_rate = 0.5  # Not used, but kept for compatibility
-            self.fire_spawn_radius = 2.0  # New fires spawn within this radius from any fire
-            self.max_fires = 20  # Limit number of fires for performance
+            self.fire_spawn_radius = 5.0  # New fires spawn within this radius from any fire
+            self.max_fires = 10  # Limit number of fires for performance
+        # Scenario 3: line of fires (cylinders) along x axis
+        if scenario == 3:
+            # Place fires at regular intervals along x axis at y=area_size/2, z=5 (on ground)
+            n_fires = 10
+            x_positions = np.linspace(1, self.area_size-1, n_fires)
+            y_pos = self.area_size / 2
+            z_pos = 5.0
+            self.fire_centers = [np.array([x, y_pos, z_pos]) for x in x_positions]
+            self.fire_radius = fire_radius
         self.action_space = spaces.Box(low=-1, high=1, shape=(self.n_drones,3), dtype=np.float32)
         # Each drone: [x, y, z, fire_below, other_x, other_y, other_z]
         low = np.array([0,0,0,0,0,0,0]*self.n_drones).reshape((self.n_drones,7))
@@ -74,6 +83,12 @@ class DroneEnv(gym.Env):
         self.cell_rewards = np.full((self.grid_dim, self.grid_dim), self.max_cell_reward, dtype=np.int32)  # Reset cell rewards to max
         if self.scenario == 2:
             self.fire_centers = [np.mean(self.fire_line, axis=0)]
+        if self.scenario == 3:
+            n_fires = 10
+            x_positions = np.linspace(1, self.area_size-1, n_fires)
+            y_pos = self.area_size / 2
+            z_pos = 5.0
+            self.fire_centers = [np.array([x, y_pos, z_pos]) for x in x_positions]
         return self._get_obs(), {}
 
     def _get_obs(self):
@@ -86,6 +101,24 @@ class DroneEnv(gym.Env):
             t = np.clip(t, 0, 1)
             closest = a + t * ab
             return np.linalg.norm(p - closest)
+        def is_blocked_by_fire(drone_xy, fire_centers_2d, fire_radius, target_xy):
+            # Returns True if a fire is between drone_xy and target_xy
+            for fc in fire_centers_2d:
+                # Vector from drone to fire and drone to target
+                v_fire = fc - drone_xy
+                v_target = target_xy - drone_xy
+                dist_to_fire = np.linalg.norm(v_fire)
+                dist_to_target = np.linalg.norm(v_target)
+                if dist_to_fire < dist_to_target and dist_to_fire > 1e-6:
+                    # Angle between vectors
+                    cos_angle = np.dot(v_fire, v_target) / (dist_to_fire * dist_to_target + 1e-8)
+                    if cos_angle > 0.99:  # ~8 deg cone, adjust as needed
+                        # Check if fire center is close to the line from drone to target
+                        proj = np.dot(v_fire, v_target) / (np.linalg.norm(v_target) + 1e-8)
+                        closest = drone_xy + v_target / np.linalg.norm(v_target) * proj
+                        if np.linalg.norm(fc - closest) <= fire_radius:
+                            return True
+            return False
         obs = []
         k = 1.0  # scaling factor for cone radius (can be tuned)
         fire_a_2d = np.array([self.fire_line[0][0], self.fire_line[0][1]])
@@ -93,13 +126,26 @@ class DroneEnv(gym.Env):
         for i in range(self.n_drones):
             pos = self.drone_pos[i]
             other = self.drone_pos[1-i]
-            # Project drone position onto ground
             drone_xy = np.array([pos[0], pos[1]])
             z = pos[2]
-            view_radius = k * z / 4  # decreased by 2
-            # Check if fire line is within the cone's base (circle on ground)
-            dist_to_fire = point_to_segment_dist_2d(drone_xy, fire_a_2d, fire_b_2d)
-            fire_in_view = 1.0 if dist_to_fire <= (view_radius + self.fire_radius) else 0.0
+            view_radius = k * z / 8
+            # Default: fire_in_view logic as before
+            fire_in_view = 0.0
+            if self.scenario == 2 or self.scenario == 3:
+                # Check if any fire is visible (not blocked by another fire)
+                fire_centers_2d = np.array([[fc[0], fc[1]] for fc in self.fire_centers])
+                for fc in fire_centers_2d:
+                    dist = np.linalg.norm(drone_xy - fc)
+                    if dist <= (view_radius + self.fire_radius):
+                        # Check if this fire is blocked by another fire
+                        blocked = is_blocked_by_fire(drone_xy, fire_centers_2d, self.fire_radius, fc)
+                        if not blocked:
+                            fire_in_view = 1.0
+                            break
+            else:
+                # Scenario 1: fire line
+                dist_to_fire = point_to_segment_dist_2d(drone_xy, fire_a_2d, fire_b_2d)
+                fire_in_view = 1.0 if dist_to_fire <= (view_radius + self.fire_radius) else 0.0
             obs.append(np.concatenate([pos, [fire_in_view], other]))
         return np.stack(obs)
 
@@ -118,7 +164,7 @@ class DroneEnv(gym.Env):
             # With some probability, add a new fire near an existing fire
             if len(self.fire_centers) < self.max_fires:
                 for center in list(self.fire_centers):
-                    if np.random.rand() < 0.01:  # 3% chance per fire per step
+                    if np.random.rand() < 0.02:  # 1% chance per fire per step
                         angle = np.random.uniform(0, 2 * np.pi)
                         height = np.random.uniform(-2, 2)
                         r = np.random.uniform(0.5, self.fire_spawn_radius)
@@ -131,6 +177,7 @@ class DroneEnv(gym.Env):
                         # Only add if not too close to existing fires
                         if all(np.linalg.norm(new_center - fc) > self.fire_radius * 1.5 for fc in self.fire_centers):
                             self.fire_centers.append(new_center)
+        # Scenario 3: fires are static, no spread
         # Check collisions
         def point_to_segment_dist(p, a, b):
             ap = p - a
@@ -148,7 +195,7 @@ class DroneEnv(gym.Env):
         proximity_scale = 200.0  # Higher scale to emphasize importance
         
         for i in range(self.n_drones):
-            if self.scenario == 2:
+            if self.scenario == 2 or self.scenario == 3:
                 # Find closest fire center
                 dists = [np.linalg.norm(self.drone_pos[i] - fc) for fc in self.fire_centers]
                 min_dist = min(dists)
@@ -193,7 +240,7 @@ class DroneEnv(gym.Env):
             pos = self.drone_pos[i]
             drone_xy = np.array([pos[0], pos[1]])
             z = pos[2]
-            view_radius = 1.0 * z / 4
+            view_radius = 1.0 * z / 8
             x_min = max(0, int((drone_xy[0] - view_radius) // grid_size))
             x_max = min(grid_dim - 1, int((drone_xy[0] + view_radius) // grid_size))
             y_min = max(0, int((drone_xy[1] - view_radius) // grid_size))
@@ -244,7 +291,7 @@ class DroneEnv(gym.Env):
         ax.set_ylim([0, self.area_size])
         ax.set_zlim([0, self.area_size])
         # Draw fire line or fires
-        if self.scenario == 2:
+        if self.scenario == 2 or self.scenario == 3:
             # Draw all fire centers as vertical cylinders attached to the floor
             fire_height = self.area_size  # Cylinder height (floor to ceiling)
             n_cylinder = 24
@@ -284,20 +331,52 @@ class DroneEnv(gym.Env):
             ax.plot_surface(x, y, z, color='b', alpha=0.5)
         # Draw cone base (field of view) for each drone
         k = 1.0  # must match _get_obs
-        for pos in (drone_pos if drone_pos is not None else self.drone_pos):
+        for idx, pos in enumerate(drone_pos if drone_pos is not None else self.drone_pos):
             drone_xy = np.array([pos[0], pos[1]])
             z = pos[2]
-            view_radius = k * z / 4  # decreased by 2
-            # Draw a disk on the ground (z=0)
-            theta = np.linspace(0, 2 * np.pi, 50)
+            view_radius = k * z / 8
+            theta = np.linspace(0, 2 * np.pi, 200)
             circle_x = drone_xy[0] + view_radius * np.cos(theta)
             circle_y = drone_xy[1] + view_radius * np.sin(theta)
             circle_z = np.zeros_like(theta)
-            ax.plot(circle_x, circle_y, circle_z, color='orange', alpha=0.6, linewidth=1.5)
-            # Filled disk using Poly3DCollection
-            verts = [list(zip(circle_x, circle_y, circle_z))]
-            poly = Poly3DCollection(verts, color='orange', alpha=0.15)
-            ax.add_collection3d(poly)
+            # Mask the field of view if blocked by a fire (scenarios 2/3)
+            if self.scenario == 2 or self.scenario == 3:
+                fire_centers_plot = fire_centers if fire_centers is not None else self.fire_centers
+                fire_centers_2d = np.array([[fc[0], fc[1]] for fc in fire_centers_plot])
+                mask = np.ones_like(theta, dtype=bool)
+                for fc in fire_centers_2d:
+                    v_fire = fc - drone_xy
+                    dist_to_fire = np.linalg.norm(v_fire)
+                    if dist_to_fire <= (view_radius + self.fire_radius):
+                        angle_fire = np.arctan2(v_fire[1], v_fire[0])
+                        # Block a sector behind the fire (shadow)
+                        block_angle = np.arcsin(self.fire_radius / (dist_to_fire + 1e-8)) if dist_to_fire > self.fire_radius else np.pi
+                        # For each theta, check if it is behind the fire
+                        for j, t in enumerate(theta):
+                            # Vector from drone to this theta
+                            v_theta = np.array([np.cos(t), np.sin(t)])
+                            angle_diff = np.arctan2(np.sin(t - angle_fire), np.cos(t - angle_fire))
+                            # Block the sector behind the fire (opposite direction)
+                            if abs(angle_diff) < block_angle:
+                                # Only block if the point is further than the fire
+                                pt = drone_xy + view_radius * v_theta
+                                if np.linalg.norm(pt - drone_xy) > dist_to_fire:
+                                    mask[j] = False
+                # Only plot visible part of the disk
+                circle_x_masked = circle_x[mask]
+                circle_y_masked = circle_y[mask]
+                circle_z_masked = circle_z[mask]
+                if len(circle_x_masked) > 2:
+                    ax.plot(circle_x_masked, circle_y_masked, circle_z_masked, color='orange', alpha=0.6, linewidth=1.5)
+                    verts = [list(zip(circle_x_masked, circle_y_masked, circle_z_masked))]
+                    poly = Poly3DCollection(verts, color='orange', alpha=0.15)
+                    ax.add_collection3d(poly)
+            else:
+                # No occlusion
+                ax.plot(circle_x, circle_y, circle_z, color='orange', alpha=0.6, linewidth=1.5)
+                verts = [list(zip(circle_x, circle_y, circle_z))]
+                poly = Poly3DCollection(verts, color='orange', alpha=0.15)
+                ax.add_collection3d(poly)
         # Draw safety AABB as transparent cubes (12 edges each)
         for pos in (drone_pos if drone_pos is not None else self.drone_pos):
             aabb_min = pos - (self.drone_radius + self.safety_margin)
@@ -570,11 +649,11 @@ class TD3Agent:
 
 # --- MAIN LOOP ---
 def main():
-    scenarios = [1, 2]
-    scenario_names = {1: "Static Fire Line", 2: "Spreading Fire"}
+    scenarios = [1, 3, 2]
+    scenario_names = {1: "Static Fire Line", 3: "Line of Fires", 2: "Spreading Fire"}
     num_scenarios = len(scenarios)
-    num_episodes = 5  # Total episodes per scenario
-    curriculum_episodes = 1  # Episodes per curriculum level
+    num_episodes = 25  # Total episodes per scenario
+    curriculum_episodes = 5  # Episodes per curriculum level
 
     episode_rewards = [[], []]  # Store total points per episode for each drone
     avg_fire_distances = [[], []]  # Track average distance to fire per episode
@@ -667,7 +746,7 @@ def main():
                         pos = next_obs[i]
                         drone_xy = np.array([pos[0], pos[1]])
                         z = pos[2]
-                        view_radius = k * z / 4
+                        view_radius = k * z / 8
                         seen_areas[i].append((drone_xy[0], drone_xy[1], view_radius))
 
                     for i in range(env.n_drones):
@@ -809,37 +888,32 @@ def main():
     plt.tight_layout()
     plt.show()
 
-    # --- Integrated Reward System Heatmap ---
-    # For each cell, calculate: proximity to fire reward + edge penalty + exploration reward
-    grid_size = env.grid_size
-    grid_dim = env.grid_dim
-    area_size = env.area_size
-    fire_line = env.fire_line
-    fire_radius = env.fire_radius
-    drone_radius = env.drone_radius
-    safety_margin = env.base_safety_margin  # Use base safety margin for analysis
-    max_cell_reward = env.max_cell_reward
-    cell_rewards = env.cell_rewards
+    # --- Integrated Reward System Heatmap (for last scenario/level) ---
+    # Use scenario 3 (line of fires) and curriculum_level=4 (lowest safety margin)
+    final_env = DroneEnv(curriculum_level=4, scenario=3)
+    grid_size = final_env.grid_size
+    grid_dim = final_env.grid_dim
+    area_size = final_env.area_size
+    fire_centers = final_env.fire_centers
+    fire_radius = final_env.fire_radius
+    drone_radius = final_env.drone_radius
+    safety_margin = final_env.base_safety_margin  # Use base safety margin for analysis
+    max_cell_reward = final_env.max_cell_reward
+    cell_rewards = final_env.cell_rewards
     alpha = 1.2  # Updated to match new parameters
     proximity_scale = 200.0
     edge_penalty_scale = 50.0
     edge_penalty_alpha = 2.0
     z = 7.5  # fixed height for analysis
     integrated_reward = np.zeros((grid_dim, grid_dim))
-    def point_to_segment_dist(p, a, b):
-        ap = p - a
-        ab = b - a
-        t = np.dot(ap, ab) / (np.dot(ab, ab) + 1e-8)
-        t = np.clip(t, 0, 1)
-        closest = a + t * ab
-        return np.linalg.norm(p - closest)
     for gx in range(grid_dim):
         for gy in range(grid_dim):
             cx = gx * grid_size + grid_size/2
             cy = gy * grid_size + grid_size/2
             pos = np.array([cx, cy, z])
-            # Proximity to fire
-            dist_fire = point_to_segment_dist(pos, fire_line[0], fire_line[1])
+            # Proximity to closest fire (for scenario 3)
+            dists = [np.linalg.norm(pos - fc) for fc in fire_centers]
+            dist_fire = min(dists)
             min_safe_dist = drone_radius + fire_radius + safety_margin
             collision_dist = drone_radius + fire_radius
             if dist_fire <= collision_dist:
@@ -856,8 +930,8 @@ def main():
                     optimal_bonus = 100 * (1 - safe_distance / optimal_range)
                     fire_reward += optimal_bonus
             # Edge penalty (only when very close)
-            dists = [pos[0], area_size - pos[0], pos[1], area_size - pos[1], pos[2] - 5, 10 - pos[2]]
-            min_dist_edge = min(dists)
+            dists_edge = [pos[0], area_size - pos[0], pos[1], area_size - pos[1], pos[2] - 5, 10 - pos[2]]
+            min_dist_edge = min(dists_edge)
             if min_dist_edge < 1.0:
                 edge_penalty = edge_penalty_scale * np.exp(-edge_penalty_alpha * min_dist_edge)
             else:
@@ -868,7 +942,7 @@ def main():
             integrated_reward[gx, gy] = fire_reward - edge_penalty + exploration_reward
     plt.figure(figsize=(6, 5))
     plt.imshow(integrated_reward.T, origin='lower', cmap='coolwarm')
-    plt.title('Integrated Reward System Heatmap (Final Level)')
+    plt.title('Integrated Reward System Heatmap (Scenario 3, Final Level)')
     plt.xlabel('Grid X')
     plt.ylabel('Grid Y')
     plt.colorbar(label='Total Reward Value')
