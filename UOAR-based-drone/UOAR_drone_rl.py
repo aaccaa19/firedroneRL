@@ -133,9 +133,11 @@ class DroneEnv(gym.Env):
         def is_blocked_by_fire(drone_xy, fire_centers_2d, fire_radius, target_xy):
             # Returns True if a fire is between drone_xy and target_xy
             for fc in fire_centers_2d:
+                # Ensure fc is 2D for all calculations
+                fc2d = fc[:2] if fc.shape[0] > 2 else fc
                 # Vector from drone to fire and drone to target
-                v_fire = fc - drone_xy
-                v_target = target_xy - drone_xy
+                v_fire = fc2d - drone_xy
+                v_target = (target_xy[:2] if target_xy.shape[0] > 2 else target_xy) - drone_xy
                 dist_to_fire = np.linalg.norm(v_fire)
                 dist_to_target = np.linalg.norm(v_target)
                 if dist_to_fire < dist_to_target and dist_to_fire > 1e-6:
@@ -145,7 +147,7 @@ class DroneEnv(gym.Env):
                         # Check if fire center is close to the line from drone to target
                         proj = np.dot(v_fire, v_target) / (np.linalg.norm(v_target) + 1e-8)
                         closest = drone_xy + v_target / np.linalg.norm(v_target) * proj
-                        if np.linalg.norm(fc - closest) <= fire_radius:
+                        if np.linalg.norm(fc2d - closest) <= fire_radius:
                             return True
             return False
         obs = []
@@ -158,23 +160,28 @@ class DroneEnv(gym.Env):
             drone_xy = np.array([pos[0], pos[1]])
             z = pos[2]
             view_radius = k * z / 8
-            # Default: fire_in_view logic as before
             fire_in_view = 0.0
-            if self.scenario == 2 or self.scenario == 3:
-                # Check if any fire is visible (not blocked by another fire)
-                fire_centers_2d = np.array([[fc[0], fc[1]] for fc in self.fire_centers])
-                for fc in fire_centers_2d:
-                    dist = np.linalg.norm(drone_xy - fc)
-                    if dist <= (view_radius + self.fire_radius):
-                        # Check if this fire is blocked by another fire
-                        blocked = is_blocked_by_fire(drone_xy, fire_centers_2d, self.fire_radius, fc)
-                        if not blocked:
-                            fire_in_view = 1.0
-                            break
-            else:
-                # Scenario 1: fire line
-                dist_to_fire = point_to_segment_dist_2d(drone_xy, fire_a_2d, fire_b_2d)
-                fire_in_view = 1.0 if dist_to_fire <= (view_radius + self.fire_radius) else 0.0
+            # For all scenarios, check occlusion by fire (cannot see behind fire)
+            fire_centers_2d = np.array([[fc[0], fc[1]] for fc in self.fire_centers]) if self.fire_centers else np.empty((0,2))
+            # For scenario 1 and 5, treat the fire line or wall as a set of closely spaced fire centers for occlusion
+            if (self.scenario == 1 or self.scenario == 5) and fire_centers_2d.shape[0] == 0:
+                # Discretize the fire line/wall into points for occlusion
+                n_points = 20
+                if self.scenario == 1:
+                    a, b = self.fire_line[0], self.fire_line[1]
+                else:
+                    # Wall at x=fire_wall_x, spanning y and z
+                    a = np.array([self.fire_wall_x, 0])
+                    b = np.array([self.fire_wall_x, self.area_size])
+                fire_centers_2d = np.array([a + (b - a) * t for t in np.linspace(0, 1, n_points)])
+            # Check if any fire is visible (not blocked by another fire)
+            for fc in fire_centers_2d:
+                dist = np.linalg.norm(drone_xy - fc[:2])
+                if dist <= (view_radius + self.fire_radius):
+                    blocked = is_blocked_by_fire(drone_xy, fire_centers_2d, self.fire_radius, fc)
+                    if not blocked:
+                        fire_in_view = 1.0
+                        break
             obs.append(np.concatenate([pos, [fire_in_view], other]))
         return np.stack(obs)
 
@@ -290,27 +297,33 @@ class DroneEnv(gym.Env):
             x_max = min(grid_dim - 1, int((drone_xy[0] + view_radius) // grid_size))
             y_min = max(0, int((drone_xy[1] - view_radius) // grid_size))
             y_max = min(grid_dim - 1, int((drone_xy[1] + view_radius) // grid_size))
+            # For all scenarios, use fire occlusion
+            fire_centers_2d = np.array([[fc[0], fc[1]] for fc in self.fire_centers]) if self.fire_centers else np.empty((0,2))
+            if (self.scenario == 1 or self.scenario == 5) and fire_centers_2d.shape[0] == 0:
+                n_points = 20
+                if self.scenario == 1:
+                    a, b = self.fire_line[0], self.fire_line[1]
+                else:
+                    a = np.array([self.fire_wall_x, 0])
+                    b = np.array([self.fire_wall_x, self.area_size])
+                fire_centers_2d = np.array([a + (b - a) * t for t in np.linspace(0, 1, n_points)])
             for gx in range(x_min, x_max+1):
                 for gy in range(y_min, y_max+1):
                     cx = gx * grid_size + grid_size/2
                     cy = gy * grid_size + grid_size/2
                     cell_xy = np.array([cx, cy])
                     if np.linalg.norm(drone_xy - cell_xy) <= view_radius:
-                        # Check if this cell is occluded by any fire (i.e., behind a fire from the drone's perspective)
                         occluded = False
-                        if self.scenario in [2, 3, 4]:
-                            fire_centers_2d = np.array([[fc[0], fc[1]] for fc in self.fire_centers])
-                            for fc in fire_centers_2d:
-                                v_fire = fc - drone_xy
-                                v_cell = cell_xy - drone_xy
-                                dist_to_fire = np.linalg.norm(v_fire)
-                                dist_to_cell = np.linalg.norm(v_cell)
-                                if dist_to_fire < dist_to_cell and dist_to_fire > 1e-6:
-                                    # Angle between vectors
-                                    cos_angle = np.dot(v_fire, v_cell) / (dist_to_fire * dist_to_cell + 1e-8)
-                                    if cos_angle > 0.99:
-                                        occluded = True
-                                        break
+                        for fc in fire_centers_2d:
+                            v_fire = fc[:2] - drone_xy
+                            v_cell = cell_xy - drone_xy
+                            dist_to_fire = np.linalg.norm(v_fire)
+                            dist_to_cell = np.linalg.norm(v_cell)
+                            if dist_to_fire < dist_to_cell and dist_to_fire > 1e-6:
+                                cos_angle = np.dot(v_fire, v_cell) / (dist_to_fire * dist_to_cell + 1e-8)
+                                if cos_angle > 0.99:
+                                    occluded = True
+                                    break
                         if not occluded:
                             seen_mask[gx, gy] = True
         # Give reduced reward for seen cells, reset their reward to 0
@@ -318,7 +331,7 @@ class DroneEnv(gym.Env):
         for gx in range(grid_dim):
             for gy in range(grid_dim):
                 if seen_mask[gx, gy]:
-                    reward = self.cell_rewards[gx, gy] * exploration_scale
+                    reward = self.cell_rewards[gx, gy] * exploration_scale + 25
                     if reward > 0:
                         for i in range(self.n_drones):
                             rewards[i] += reward
@@ -341,149 +354,6 @@ class DroneEnv(gym.Env):
                 edge_penalty = edge_penalty_scale * np.exp(-edge_penalty_alpha * min_dist)
                 rewards[i] -= edge_penalty
 
-        self.done = dones
-        return self._get_obs(), rewards, dones, False, {}
-        # Scenario 2: fire spreads each step
-        if self.scenario == 2:
-            # With some probability, add a new fire near an existing fire
-            if len(self.fire_centers) < self.max_fires:
-                for center in list(self.fire_centers):
-                    if np.random.rand() < 0.02:  # 1% chance per fire per step
-                        angle = np.random.uniform(0, 2 * np.pi)
-                        height = np.random.uniform(-2, 2)
-                        r = np.random.uniform(0.5, self.fire_spawn_radius)
-                        dx = r * np.cos(angle)
-                        dy = r * np.sin(angle)
-                        dz = height
-                        new_center = center + np.array([dx, dy, dz])
-                        # Keep within bounds
-                        new_center = np.clip(new_center, [0, 0, 5], [self.area_size, self.area_size, 10])
-                        # Only add if not too close to existing fires
-                        if all(np.linalg.norm(new_center - fc) > self.fire_radius * 1.5 for fc in self.fire_centers):
-                            self.fire_centers.append(new_center)
-        # Scenario 3: fires are static, no spread
-        # Check collisions
-        def point_to_segment_dist(p, a, b):
-            ap = p - a
-            ab = b - a
-            t = np.dot(ap, ab) / (np.dot(ab, ab) + 1e-8)
-            t = np.clip(t, 0, 1)
-            closest = a + t * ab
-            return np.linalg.norm(p - closest)
-        
-        min_safe_dist = self.drone_radius + self.fire_radius + self.safety_margin
-        collision_dist = self.drone_radius + self.fire_radius  # Actual collision boundary
-        
-        # More gradual reward structure for fire proximity
-        alpha = 1.2  # Much gentler exponential curve
-        proximity_scale = 200.0  # Higher scale to emphasize importance
-        
-        for i in range(self.n_drones):
-            if self.scenario in [2, 3, 4]:
-                # Find closest fire center
-                dists = [np.linalg.norm(self.drone_pos[i] - fc) for fc in self.fire_centers]
-                min_dist = min(dists)
-                collision_dist = self.drone_radius + self.fire_radius
-                min_safe_dist = self.drone_radius + self.fire_radius + self.safety_margin
-            else:
-                min_dist = point_to_segment_dist(self.drone_pos[i], self.fire_line[0], self.fire_line[1])
-                collision_dist = self.drone_radius + self.fire_radius
-                min_safe_dist = self.drone_radius + self.fire_radius + self.safety_margin
-            if min_dist <= collision_dist:
-                # Hard collision - terminal state
-                rewards[i] = -200
-                dones[i] = True
-            elif min_dist <= min_safe_dist:
-                # Danger zone - steep penalty but not terminal, encouraging learning
-                danger_factor = (min_safe_dist - min_dist) / (min_safe_dist - collision_dist)
-                rewards[i] += -50 * (danger_factor ** 2)  # Quadratic penalty in danger zone
-            else:
-                # Safe zone - exponential reward for proximity
-                safe_distance = min_dist - min_safe_dist
-                exp_reward = proximity_scale * np.exp(-alpha * safe_distance)
-                rewards[i] += exp_reward
-                # Additional bonus for being in optimal range (just outside safety margin)
-                optimal_range = 0.3  # Distance beyond safety margin that's considered optimal
-                if safe_distance <= optimal_range:
-                    optimal_bonus = 100 * (1 - safe_distance / optimal_range)
-                    rewards[i] += optimal_bonus
-        
-        # Drone-drone collision
-        if np.linalg.norm(self.drone_pos[0] - self.drone_pos[1]) < 2*self.drone_radius + self.safety_margin:
-            rewards = [-50, -50]  # Reduced penalty to encourage learning
-            dones = [True, True]
-        
-        # Exploration reward (reduced impact)
-        grid_size = self.grid_size
-        grid_dim = self.grid_dim
-        max_reward = self.max_cell_reward
-        regen_rate = self.cell_regen_rate
-        # Build a mask of which cells are seen by any drone this step, accounting for occlusion by fire
-        seen_mask = np.zeros((grid_dim, grid_dim), dtype=bool)
-        for i in range(self.n_drones):
-            pos = self.drone_pos[i]
-            drone_xy = np.array([pos[0], pos[1]])
-            z = pos[2]
-            view_radius = 1.0 * z / 8
-            x_min = max(0, int((drone_xy[0] - view_radius) // grid_size))
-            x_max = min(grid_dim - 1, int((drone_xy[0] + view_radius) // grid_size))
-            y_min = max(0, int((drone_xy[1] - view_radius) // grid_size))
-            y_max = min(grid_dim - 1, int((drone_xy[1] + view_radius) // grid_size))
-            for gx in range(x_min, x_max+1):
-                for gy in range(y_min, y_max+1):
-                    cx = gx * grid_size + grid_size/2
-                    cy = gy * grid_size + grid_size/2
-                    cell_xy = np.array([cx, cy])
-                    if np.linalg.norm(drone_xy - cell_xy) <= view_radius:
-                        # Check if this cell is occluded by any fire (i.e., behind a fire from the drone's perspective)
-                        occluded = False
-                        if self.scenario in [2, 3, 4]:
-                            fire_centers_2d = np.array([[fc[0], fc[1]] for fc in self.fire_centers])
-                            for fc in fire_centers_2d:
-                                v_fire = fc - drone_xy
-                                v_cell = cell_xy - drone_xy
-                                dist_to_fire = np.linalg.norm(v_fire)
-                                dist_to_cell = np.linalg.norm(v_cell)
-                                if dist_to_fire < dist_to_cell and dist_to_fire > 1e-6:
-                                    # Angle between vectors
-                                    cos_angle = np.dot(v_fire, v_cell) / (dist_to_fire * dist_to_cell + 1e-8)
-                                    if cos_angle > 0.99:  # ~8 deg cone
-                                        # Check if fire center is close to the line from drone to cell
-                                        proj = np.dot(v_fire, v_cell) / (np.linalg.norm(v_cell) + 1e-8)
-                                        closest = drone_xy + v_cell / (np.linalg.norm(v_cell) + 1e-8) * proj
-                                        if np.linalg.norm(fc - closest) <= self.fire_radius:
-                                            occluded = True
-                                            break
-                        if not occluded:
-                            seen_mask[gx, gy] = True
-        # Give reduced reward for seen cells, reset their reward to 0
-        exploration_scale = 0.5  # Reduced impact of exploration
-        for gx in range(grid_dim):
-            for gy in range(grid_dim):
-                if seen_mask[gx, gy]:
-                    reward = self.cell_rewards[gx, gy] * exploration_scale
-                    if reward > 0:
-                        for i in range(self.n_drones):
-                            rewards[i] += reward
-                        self.cell_rewards[gx, gy] = 0
-                else:
-                    # Regenerate reward for unseen cells
-                    if self.cell_rewards[gx, gy] < max_reward:
-                        self.cell_rewards[gx, gy] = min(max_reward, self.cell_rewards[gx, gy] + regen_rate)
-        
-        # Reduced edge penalty to not interfere with fire proximity
-        edge_penalty_scale = 50.0  # Much lower penalty
-        edge_penalty_alpha = 2.0   # Less steep penalty curve
-        for i in range(self.n_drones):
-            pos = self.drone_pos[i]
-            # Distance to each wall (x=0, x=max, y=0, y=max, z=5, z=10)
-            dists = [pos[0], self.area_size - pos[0], pos[1], self.area_size - pos[1], pos[2] - 5, 10 - pos[2]]
-            min_dist = min(dists)
-            # Only apply edge penalty when very close to walls
-            if min_dist < 1.0:  # Only within 1 unit of walls
-                edge_penalty = edge_penalty_scale * np.exp(-edge_penalty_alpha * min_dist)
-                rewards[i] -= edge_penalty
-        
         self.done = dones
         return self._get_obs(), rewards, dones, False, {}
 
