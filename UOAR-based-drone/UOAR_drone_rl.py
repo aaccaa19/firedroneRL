@@ -60,6 +60,11 @@ class DroneEnv(gym.Env):
                 z = np.random.uniform(5, 10)
                 self.fire_centers.append(np.array([x, y, z]))
             # fire_radius already set above
+        # Scenario 6: large central fire
+        elif scenario == 6:
+            center = np.array([self.area_size / 2, self.area_size / 2, self.area_size / 2])
+            self.fire_centers = [center]
+            self.fire_radius = 2.5  # Large fire size for scenario 6
         self.action_space = spaces.Box(low=-1, high=1, shape=(self.n_drones,3), dtype=np.float32)
         # Each drone: [x, y, z, fire_below, other_x, other_y, other_z]
         low = np.array([0,0,0,0,0,0,0]*self.n_drones).reshape((self.n_drones,7))
@@ -250,12 +255,17 @@ class DroneEnv(gym.Env):
         proximity_scale = 200.0  # Higher scale to emphasize importance
 
         for i in range(self.n_drones):
-            # For scenarios 2, 3, 4: use fire_centers; for 1 and 5: use fire_line
-            if self.scenario in [2, 3, 4]:
+            # For scenarios 2, 3, 4, 6: use fire_centers; for 1 and 5: use fire_line
+            if self.scenario in [2, 3, 4, 6]:
                 dists = [np.linalg.norm(self.drone_pos[i] - fc) for fc in self.fire_centers]
                 min_dist = min(dists)
                 collision_dist = self.drone_radius + self.fire_radius
                 min_safe_dist = self.drone_radius + self.fire_radius + self.safety_margin
+                # If inside the fire (distance to center < fire_radius), apply same penalty everywhere
+                if min_dist <= self.fire_radius:
+                    rewards[i] = -200
+                    dones[i] = True
+                    continue
             else:
                 min_dist = point_to_segment_dist(self.drone_pos[i], self.fire_line[0], self.fire_line[1])
                 collision_dist = self.drone_radius + self.fire_radius
@@ -359,6 +369,30 @@ class DroneEnv(gym.Env):
                 edge_penalty = edge_penalty_scale * np.exp(-edge_penalty_alpha * min_dist)
                 rewards[i] -= edge_penalty
 
+        # --- Custom penalties and exploration bonus ---
+        # Track previous positions for each drone
+        if not hasattr(self, 'prev_positions'):
+            self.prev_positions = [None for _ in range(self.n_drones)]
+        if not hasattr(self, 'fires_visited'):
+            self.fires_visited = [set() for _ in range(self.n_drones)]
+
+        for i in range(self.n_drones):
+            pos = self.drone_pos[i]
+            # Penalty for staying in the same place for too long
+            if self.prev_positions[i] is not None:
+                movement = np.linalg.norm(pos - self.prev_positions[i])
+                if movement < 0.15:  # Increased threshold for 'staying still'
+                    rewards[i] -= 10
+
+            self.prev_positions[i] = pos.copy()
+            # Exploration bonus for discovering new fires
+            for idx, fc in enumerate(self.fire_centers):
+                dist_to_fire = np.linalg.norm(pos - fc)
+                if dist_to_fire < (self.fire_radius + self.safety_margin + 1.0):
+                    if idx not in self.fires_visited[i]:
+                        rewards[i] += 50
+                        self.fires_visited[i].add(idx)
+
         self.done = dones
         return self._get_obs(), rewards, dones, False, {}
 
@@ -379,7 +413,7 @@ class DroneEnv(gym.Env):
             Y, Z = np.meshgrid(y, z)
             X = np.full_like(Y, fire_x)
             ax.plot_surface(X, Y, Z, color='red', alpha=0.4)
-        elif self.scenario in [2, 3, 4]:
+        elif self.scenario in [2, 3, 4, 6]:
             # Draw all fire centers as vertical cylinders attached to the floor
             fire_height = self.area_size  # Cylinder height (floor to ceiling)
             n_cylinder = 24
@@ -549,6 +583,58 @@ class ReplayBuffer:
         )
 
 class TD3Agent:
+    def save(self, filename):
+        import pickle
+        # Save only the state_dicts and relevant parameters
+        data = {
+            'actor': self.actor.state_dict(),
+            'actor_target': self.actor_target.state_dict(),
+            'critics': [c.state_dict() for c in self.critics],
+            'critics_target': [c.state_dict() for c in self.critics_target],
+            'actor_opt': self.actor_opt.state_dict(),
+            'critic_opts': [opt.state_dict() for opt in self.critic_opts],
+            'buffer': self.buffer.__dict__,
+            'params': {
+                'area_size': self.area_size,
+                'drone_radius': self.drone_radius,
+                'fire_line': self.fire_line,
+                'fire_radius': self.fire_radius,
+                'safety_margin': self.safety_margin,
+                'max_step_size': self.max_step_size,
+                'obs_dim': self.obs_dim,
+                'act_dim': self.act_dim,
+                'n_candidates': self.n_candidates,
+                'noise_levels': self.noise_levels,
+                'gamma': self.gamma,
+                'tau': self.tau,
+                'policy_noise': self.policy_noise,
+                'noise_clip': self.noise_clip,
+                'policy_delay': self.policy_delay,
+                'batch_size': self.batch_size,
+                'total_it': self.total_it
+            }
+        }
+        with open(filename, 'wb') as f:
+            pickle.dump(data, f)
+
+    def load(self, filename):
+        import pickle
+        data = None
+        with open(filename, 'rb') as f:
+            data = pickle.load(f)
+        self.actor.load_state_dict(data['actor'])
+        self.actor_target.load_state_dict(data['actor_target'])
+        for c, state in zip(self.critics, data['critics']):
+            c.load_state_dict(state)
+        for c, state in zip(self.critics_target, data['critics_target']):
+            c.load_state_dict(state)
+        self.actor_opt.load_state_dict(data['actor_opt'])
+        for opt, state in zip(self.critic_opts, data['critic_opts']):
+            opt.load_state_dict(state)
+        self.buffer.__dict__.update(data['buffer'])
+        # Optionally update params if needed
+        for k, v in data['params'].items():
+            setattr(self, k, v)
     def decay_noise(self, decay_rate=0.99, min_noise=0.01):
         """Decay the noise levels by decay_rate, not going below min_noise."""
         self.noise_levels = [max(n * decay_rate, min_noise) for n in self.noise_levels]
@@ -737,12 +823,13 @@ class TD3Agent:
 
 # --- MAIN LOOP ---
 def main():
-    scenario_names = {1: "Static Fire Line", 3: "Line of Fires", 2: "Spreading Fire", 4: "Random Fires", 5: "Impassable Fire Wall (w/ Random Crash)"}
-    all_scenarios = [1, 3, 2, 4, 5]
+    import os
+    scenario_names = {1: "Static Fire Line", 3: "Line of Fires", 2: "Spreading Fire", 4: "Random Fires", 5: "Impassable Fire Wall (w/ Random Crash)", 6: "Central Fire"}
+    all_scenarios = [1, 3, 2, 4, 5, 6]
     print("Available scenarios:")
     for s in all_scenarios:
         print(f"  {s}: {scenario_names[s]}")
-    user_input = input("Enter scenario numbers to run, separated by commas (e.g., 1,3,4): ").strip()
+    user_input = input("Enter scenario numbers to run, separated by commas (e.g., 1,3,4,1): ").strip()
     if user_input:
         try:
             scenarios = [int(x) for x in user_input.split(',') if int(x) in all_scenarios]
@@ -779,7 +866,23 @@ def main():
         act_dim=act_dim
     ) for _ in range(env.n_drones)]
 
-
+    # Ask user if they want to load previous training or start from scratch
+    load_choice = input("Load previous training from pickle file? (y/n): ").strip().lower()
+    if load_choice == 'y' and os.path.exists("td3_agent_0.pkl"):
+        agents[0].load("td3_agent_0.pkl")
+        # Copy agent 0's weights to agent 1
+        agents[1].actor.load_state_dict(agents[0].actor.state_dict())
+        agents[1].actor_target.load_state_dict(agents[0].actor_target.state_dict())
+        for i in range(len(agents[1].critics)):
+            agents[1].critics[i].load_state_dict(agents[0].critics[i].state_dict())
+            agents[1].critics_target[i].load_state_dict(agents[0].critics_target[i].state_dict())
+        agents[1].actor_opt.load_state_dict(agents[0].actor_opt.state_dict())
+        for i in range(len(agents[1].critic_opts)):
+            agents[1].critic_opts[i].load_state_dict(agents[0].critic_opts[i].state_dict())
+        agents[1].buffer.__dict__.update(agents[0].buffer.__dict__)
+        print("Loaded agent 0 and copied weights to agent 1.")
+    else:
+        print("Training will start from scratch.")
 
     for scenario_idx, scenario in enumerate(scenarios):
         print(f"\n=== SCENARIO {scenario}: {scenario_names[scenario]} ===")
@@ -809,7 +912,7 @@ def main():
                 episode_dones_per_step = []
                 rewards = [0, 0]  # Initialize rewards before first step
 
-                while not all(done) and steps < 150:
+                while not all(done) and steps < 300:
                     actions = np.zeros((env.n_drones, 3))
                     for i in range(env.n_drones):
                         if not done[i]:
@@ -1084,6 +1187,19 @@ def main():
     plt.colorbar(label='Total Reward Value')
     plt.tight_layout()
     plt.show()
+
+    # --- Save trained agents ---
+    save_input = input(f"Save trained agents to file? (y/n): ").strip().lower()
+    if save_input == 'y':
+        for i, agent in enumerate(agents):
+            fname = f"td3_agent_{i}.pkl"
+            if os.path.exists(fname):
+                overwrite = input(f"File '{fname}' exists. Overwrite? (y/n): ").strip().lower()
+                if overwrite != 'y':
+                    print(f"Skipping save for agent {i}.")
+                    continue
+            agent.save(fname)
+            print(f"Saved agent {i} to '{fname}'.")
 
 
 if __name__ == "__main__":
