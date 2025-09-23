@@ -266,6 +266,12 @@ class DroneEnv(gym.Env):
                     rewards[i] = -200
                     dones[i] = True
                     continue
+                # --- Proximity reward logic for keeping average fire distance near 1 ---
+                optimal_dist = 1.0
+                distance_error = abs(min_dist - optimal_dist)
+                rewards[i] += 200 * max(0, 1 - distance_error)
+                if min_dist > optimal_dist + 1.0:
+                    rewards[i] -= 100 * (min_dist - optimal_dist)
             else:
                 min_dist = point_to_segment_dist(self.drone_pos[i], self.fire_line[0], self.fire_line[1])
                 collision_dist = self.drone_radius + self.fire_radius
@@ -390,7 +396,7 @@ class DroneEnv(gym.Env):
                 dist_to_fire = np.linalg.norm(pos - fc)
                 if dist_to_fire < (self.fire_radius + self.safety_margin + 1.0):
                     if idx not in self.fires_visited[i]:
-                        rewards[i] += 50
+                        rewards[i] += 100
                         self.fires_visited[i].add(idx)
 
         self.done = dones
@@ -846,7 +852,7 @@ def main():
     show_vis_each = vis_input == 'y'
     num_scenarios = len(scenarios)
     num_episodes = 25  # Total episodes per scenario
-    curriculum_episodes = 1  # Episodes per curriculum level
+    curriculum_episodes = 1  # Episodes per curriculum level zzz
 
     episode_rewards = [[], []]  # Store total points per episode for each drone
     avg_fire_distances = [[], []]  # Track average distance to fire per episode
@@ -1048,7 +1054,7 @@ def main():
     plt.plot(range(len(dist1_filtered)), dist1_filtered, label='Drone 1', alpha=0.7)
     plt.plot(range(len(dist2_filtered)), dist2_filtered, label='Drone 2', alpha=0.7)
     # Add horizontal line for optimal distance
-    optimal_dist = env.drone_radius + env.fire_radius + env.base_safety_margin + 0.15
+    optimal_dist = min(env.drone_radius + env.fire_radius + env.base_safety_margin + 0.15, 1.0)
     plt.axhline(y=optimal_dist, color='green', linestyle=':', label=f'Optimal Distance ({optimal_dist:.2f})')
     # Add vertical lines for curriculum level changes
     for i in range(1, 5):
