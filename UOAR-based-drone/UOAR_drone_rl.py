@@ -4,6 +4,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
+import csv
+from pathlib import Path
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 # --- ENVIRONMENT ---
@@ -872,6 +874,22 @@ def main():
         act_dim=act_dim
     ) for _ in range(env.n_drones)]
 
+    # Prepare logs directory and CSV files (overwrite existing logs for a fresh run)
+    logs_dir = Path("logs")
+    logs_dir.mkdir(exist_ok=True)
+    training_csv_path = logs_dir / "training_metrics.csv"
+    steps_csv_path = logs_dir / "steps.csv"
+    # Open and write headers
+    training_fp = open(training_csv_path, 'w', newline='')
+    training_writer = csv.writer(training_fp)
+    training_writer.writerow(["episode", "total_reward", "length", "success", "collisions", "avg_goal_dist", "crash_types"])
+
+    steps_fp = open(steps_csv_path, 'w', newline='')
+    steps_writer = csv.writer(steps_fp)
+    steps_writer.writerow(["episode", "step", "x", "y", "z", "action0", "action1", "action2", "reward", "td_error", "rule_override"])
+
+    global_episode_counter = 0
+
     # Ask user if they want to load previous training or start from scratch
     load_choice = input("Load previous training from pickle file? (y/n): ").strip().lower()
     if load_choice == 'y' and os.path.exists("td3_agent_0.pkl"):
@@ -911,11 +929,12 @@ def main():
                 # Track seen grid cells for exploration reward
                 seen_grids = [set(), set()]
 
-                # --- Store episode states for visualization ---
+                # --- Store episode-level and step-level data for logging/visualization ---
                 episode_states = []
                 episode_fire_centers = []
                 episode_rewards_per_step = []
                 episode_dones_per_step = []
+                episode_actions = []
                 rewards = [0, 0]  # Initialize rewards before first step
 
                 while not all(done) and steps < 300:
@@ -924,16 +943,19 @@ def main():
                         if not done[i]:
                             actions[i] = agents[i].select_action(obs[i])
 
-                    # Store state before step for visualization
+                    # Store action and state before step for logging/visualization
+                    episode_actions.append(np.copy(actions))
                     episode_states.append(np.copy(obs[:, :3]))
+
+                    next_obs, rewards, done, _, _ = env.step(actions, seen_grids=seen_grids)
+
+                    # Store post-step info
                     if env.scenario == 2:
                         episode_fire_centers.append([fc.copy() for fc in env.fire_centers])
                     else:
                         episode_fire_centers.append(None)
                     episode_rewards_per_step.append(list(rewards))
                     episode_dones_per_step.append(list(done))
-
-                    next_obs, rewards, done, _, _ = env.step(actions, seen_grids=seen_grids)
 
                     # Track fire distances
                     def point_to_segment_dist(p, a, b):
@@ -1008,6 +1030,27 @@ def main():
 
                 # Episode number for this scenario/curriculum
                 scenario_episode = curriculum_level * curriculum_episodes + episode + 1
+                # Increment global episode counter and log
+                global_episode_counter += 1
+
+                # Determine success & collisions heuristically (reward <= -100 considered collision/failure)
+                collisions = sum(1 for r in total_reward if r <= -100)
+                success = 1 if collisions == 0 else 0
+                # Average goal distance (use avg_fire_distances if available)
+                try:
+                    avg_goal_dist = np.nanmean([fire_distances[i][-1] if fire_distances[i] else np.nan for i in range(env.n_drones)])
+                except Exception:
+                    avg_goal_dist = float('nan')
+
+                training_writer.writerow([global_episode_counter, float(np.mean(total_reward)), int(steps), success, int(collisions), float(avg_goal_dist), ";".join([str(ct) for ct in crash_type])])
+
+                # Write per-step rows (log only drone 0 for compactness)
+                for t in range(len(episode_states)):
+                    st = episode_states[t][0]
+                    act = episode_actions[t][0] if t < len(episode_actions) else np.array([0.0, 0.0, 0.0])
+                    reward_step = episode_rewards_per_step[t][0] if t < len(episode_rewards_per_step) else 0.0
+                    steps_writer.writerow([global_episode_counter, t, float(st[0]), float(st[1]), float(st[2]), float(act[0]), float(act[1]), float(act[2]), float(reward_step), float('nan'), 0])
+
                 print(f"Episode {scenario_episode}/{5 * curriculum_episodes} (Scenario {scenario}, Level {curriculum_level+1}) Total Rewards: {[round(r, 1) for r in total_reward]}")
                 for i in range(env.n_drones):
                     avg_dist = avg_fire_distances[i][-1] if avg_fire_distances[i] else float('inf')
@@ -1207,6 +1250,22 @@ def main():
             agent.save(fname)
             print(f"Saved agent {i} to '{fname}'.")
 
+    # Close log files if open
+    try:
+        training_fp.close()
+        steps_fp.close()
+    except Exception:
+        pass
+
+    # Offer to generate analysis plots now
+    plot_now = input("Generate analysis plots now from recorded logs? (y/n): ").strip().lower()
+    if plot_now == 'y':
+        try:
+            # Call the analysis plotting script
+            import runpy
+            runpy.run_path("analysis/plot_all_figures.py", run_name="__main__")
+        except Exception as e:
+            print("Failed to run plotting script:", e)
 
 if __name__ == "__main__":
     main()
