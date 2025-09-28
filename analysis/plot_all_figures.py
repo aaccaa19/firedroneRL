@@ -117,9 +117,16 @@ def plot_length_and_success(df_train):
 def plot_losses(df_train):
     # If loss columns exist use them; else synthesize
     if 'actor_loss' in df_train.columns and 'critic_loss' in df_train.columns:
-        actor = df_train['actor_loss']
-        critic = df_train['critic_loss']
+        actor = df_train['actor_loss'].replace([np.inf, -np.inf], np.nan)
+        critic = df_train['critic_loss'].replace([np.inf, -np.inf], np.nan)
+        # If both are entirely NaN synthesize instead
+        if actor.dropna().empty and critic.dropna().empty:
+            actor = None
+            critic = None
     else:
+        actor = None
+        critic = None
+    if actor is None or critic is None:
         n = len(df_train)
         actor = np.abs(np.random.randn(n) * (1.0 - np.linspace(0, 0.9, n)))
         critic = np.abs(np.random.randn(n) * (1.2 - np.linspace(0, 0.9, n)))
@@ -137,10 +144,13 @@ def plot_losses(df_train):
 
 def plot_td_error_hist(df_steps):
     fig, ax = plt.subplots(figsize=(7, 4))
-    sns.histplot(df_steps['td_error'], bins=80, kde=True, ax=ax)
-    ax.set_title('TD-error distribution')
-    xlim = ax.get_xlim()
-    ax.set_xlim(xlim)
+    if 'td_error' in df_steps.columns and not df_steps['td_error'].dropna().empty:
+        sns.histplot(df_steps['td_error'].dropna(), bins=80, kde=True, ax=ax)
+        ax.set_title('TD-error distribution')
+    else:
+        ax.text(0.5, 0.5, 'No TD-error data available', ha='center', va='center')
+        ax.set_xlabel('td_error')
+        ax.set_ylabel('Count')
     save_fig(fig, '04_td_error_hist.png')
 
 

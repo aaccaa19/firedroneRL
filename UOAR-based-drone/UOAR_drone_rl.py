@@ -8,6 +8,44 @@ import csv
 from pathlib import Path
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
+# --- TUNABLE CONSTANTS (centralized) ---
+# Reward/penalty scaling
+# Split terminal penalties so collisions (hard failures) can be stronger than timeouts
+COLLISION_PENALTY = -80.0
+TIMEOUT_PENALTY = -20.0
+# Backwards-compatible alias (some code paths may still reference TERMINAL_PENALTY)
+TERMINAL_PENALTY = COLLISION_PENALTY
+
+# Energy: smaller coefficient and tighter clipping to avoid domination
+ENERGY_COEF = 0.002   # smaller coefficient for per-step energy magnitude
+# Per-step clip for energy-based penalty (post-baseline subtraction)
+ENERGY_CLIP = 1.0     # tighter clip to avoid huge single-step penalties
+REWARD_CLIP = 50.0
+NORMALIZED_REWARD_CLIP = 5.0
+PROXIMITY_SCALE = 18.0
+OPTIMAL_BONUS = 12.0
+# Per-component weights to balance reward components (prox, exploration, energy)
+PROX_WEIGHT = 1.5
+EXPL_WEIGHT = 0.6
+# Lower energy weight significantly so it no longer drowns other signals
+ENERGY_WEIGHT = 0.00008
+# Small L2 regularizer on policy actions to discourage saturation (in actor loss)
+ACT_REG = 1e-2
+
+# Replay / normalization warm-up
+REPLAY_WARMUP = 20000  # env steps before training/normalizing rewards
+# Increase warmup transitions so normalization and critic updates are stable
+N_WARMUP_TRANSITIONS = 10000  # transitions to collect before using normalization
+
+# Optional small actor-side energy regularizer (penalize large action magnitudes)
+ENERGY_ACT_REG = 2e-3
+
+# Training / TD3 defaults
+TARGET_CLIP = 4.0     # slightly relaxed target clipping to preserve learning signal
+GRAD_CLIP_NORM = 1.0
+# Actor regularization to discourage action saturation
+ACT_REG = 5e-3
+
 # --- ENVIRONMENT ---
 class DroneEnv(gym.Env):
     def __init__(self, area_size=10, drone_radius=0.25, fire_line=((5,5,0),(5,5,10)), fire_radius=0.25, safety_margin=0.1, max_step_size=0.5, curriculum_level=0, scenario=1):
@@ -77,8 +115,9 @@ class DroneEnv(gym.Env):
         grid_dim = int(self.area_size // grid_size)
         self.grid_size = grid_size
         self.grid_dim = grid_dim
-        self.max_cell_reward = 50  # Reduced to not overwhelm fire proximity reward
-        self.cell_regen_rate = 5   # Slower regeneration
+        # Keep per-cell rewards small to avoid runaway episode sums
+        self.max_cell_reward = 10
+        self.cell_regen_rate = 2
         self.cell_rewards = np.full((grid_dim, grid_dim), self.max_cell_reward, dtype=np.int32)
         self.reset()
 
@@ -201,14 +240,17 @@ class DroneEnv(gym.Env):
         actions = np.clip(actions, -1, 1)
         rewards = [0, 0]
         dones = [False, False]
+        # per-step bookkeeping for logging: exploration and proximity contributions
+        exploration_contrib = [0.0 for _ in range(self.n_drones)]
+        proximity_contrib = [0.0 for _ in range(self.n_drones)]
         # Move both drones (with scenario 5 wall and random crash logic applied inline)
         for i in range(self.n_drones):
             a = actions[i]
             a = a / (np.linalg.norm(a) + 1e-8) * min(np.linalg.norm(a), 1.0)
             a = a * self.max_step_size
             # Scenario 5: 1% random crash chance
-            if self.scenario == 5 and np.random.rand() < 0.01:
-                rewards[i] = -200
+            if self.scenario == 5 and np.random.rand() < 0.006:
+                rewards[i] = COLLISION_PENALTY
                 dones[i] = True
                 continue
             # Scenario 5: impassable fire wall at x=area_size/2
@@ -216,7 +258,7 @@ class DroneEnv(gym.Env):
                 x0 = self.drone_pos[i][0]
                 x1 = np.clip(self.drone_pos[i][0] + a[0], 0, self.area_size)
                 if (x0 < self.fire_wall_x and x1 >= self.fire_wall_x) or (x0 > self.fire_wall_x and x1 <= self.fire_wall_x):
-                    rewards[i] = -200
+                    rewards[i] = COLLISION_PENALTY
                     dones[i] = True
                     continue
             # Normal movement if not crashing or hitting wall
@@ -254,7 +296,8 @@ class DroneEnv(gym.Env):
         collision_dist = self.drone_radius + self.fire_radius  # Actual collision boundary
 
         alpha = 1.2  # Much gentler exponential curve
-        proximity_scale = 200.0  # Higher scale to emphasize importance
+        # Reduced proximity scale to avoid huge Q values and unstable training
+        proximity_scale = PROXIMITY_SCALE
 
         for i in range(self.n_drones):
             # For scenarios 2, 3, 4, 6: use fire_centers; for 1 and 5: use fire_line
@@ -265,15 +308,20 @@ class DroneEnv(gym.Env):
                 min_safe_dist = self.drone_radius + self.fire_radius + self.safety_margin
                 # If inside the fire (distance to center < fire_radius), apply same penalty everywhere
                 if min_dist <= self.fire_radius:
-                    rewards[i] = -200
+                    rewards[i] = COLLISION_PENALTY
                     dones[i] = True
                     continue
                 # --- Proximity reward logic for keeping average fire distance near 1 ---
                 optimal_dist = 1.0
                 distance_error = abs(min_dist - optimal_dist)
-                rewards[i] += 200 * max(0, 1 - distance_error)
+                # Small bounded proximal encouragement scaled by PROXIMITY_SCALE
+                prox = PROXIMITY_SCALE * max(0, 1 - distance_error)
+                rewards[i] += PROX_WEIGHT * prox
+                proximity_contrib[i] += PROX_WEIGHT * prox
                 if min_dist > optimal_dist + 1.0:
-                    rewards[i] -= 100 * (min_dist - optimal_dist)
+                    pen = - (PROXIMITY_SCALE / 2.0) * (min_dist - optimal_dist)
+                    rewards[i] += PROX_WEIGHT * pen
+                    proximity_contrib[i] += PROX_WEIGHT * pen
             else:
                 min_dist = point_to_segment_dist(self.drone_pos[i], self.fire_line[0], self.fire_line[1])
                 collision_dist = self.drone_radius + self.fire_radius
@@ -282,26 +330,30 @@ class DroneEnv(gym.Env):
                 continue  # Already crashed (e.g., scenario 5 random crash or wall)
             if min_dist <= collision_dist:
                 # Hard collision - terminal state
-                rewards[i] = -200
+                rewards[i] = TERMINAL_PENALTY
                 dones[i] = True
             elif min_dist <= min_safe_dist:
                 # Danger zone - steep penalty but not terminal, encouraging learning
                 danger_factor = (min_safe_dist - min_dist) / (min_safe_dist - collision_dist)
-                rewards[i] += -50 * (danger_factor ** 2)  # Quadratic penalty in danger zone
+                penalty = - (PROXIMITY_SCALE * 2.0) * (danger_factor ** 2)  # Quadratic penalty in danger zone
+                rewards[i] += penalty
+                proximity_contrib[i] += penalty
             else:
                 # Safe zone - exponential reward for proximity
                 safe_distance = min_dist - min_safe_dist
                 exp_reward = proximity_scale * np.exp(-alpha * safe_distance)
-                rewards[i] += exp_reward
+                rewards[i] += PROX_WEIGHT * exp_reward
+                proximity_contrib[i] += PROX_WEIGHT * exp_reward
                 # Additional bonus for being in optimal range (just outside safety margin)
                 optimal_range = 0.3  # Distance beyond safety margin that's considered optimal
                 if safe_distance <= optimal_range:
-                    optimal_bonus = 100 * (1 - safe_distance / optimal_range)
-                    rewards[i] += optimal_bonus
+                    optimal_bonus = OPTIMAL_BONUS * (1 - safe_distance / optimal_range)
+                    rewards[i] += PROX_WEIGHT * optimal_bonus
+                    proximity_contrib[i] += PROX_WEIGHT * optimal_bonus
 
         # Drone-drone collision
         if np.linalg.norm(self.drone_pos[0] - self.drone_pos[1]) < 2*self.drone_radius + self.safety_margin:
-            rewards = [-50, -50]  # Reduced penalty to encourage learning
+            rewards = [COLLISION_PENALTY, COLLISION_PENALTY]
             dones = [True, True]
 
         # Exploration reward (reduced impact)
@@ -350,14 +402,20 @@ class DroneEnv(gym.Env):
                         if not occluded:
                             seen_mask[gx, gy] = True
         # Give reduced reward for seen cells, reset their reward to 0
-        exploration_scale = 0.5  # Reduced impact of exploration
+        exploration_scale = 0.05  # Reduced impact of exploration (smaller to avoid large totals)
+        # Iterate cells and distribute clamped per-cell reward to drones equally
         for gx in range(grid_dim):
             for gy in range(grid_dim):
                 if seen_mask[gx, gy]:
-                    reward = self.cell_rewards[gx, gy] * exploration_scale + 25
-                    if reward > 0:
+                    base = float(self.cell_rewards[gx, gy])
+                    # Removed additive constant and clamp to tighter range
+                    reward = base * exploration_scale
+                    reward = float(np.clip(reward, -REWARD_CLIP, REWARD_CLIP))
+                    if reward != 0:
+                        per_drone = reward / float(self.n_drones)
                         for i in range(self.n_drones):
-                            rewards[i] += reward
+                            rewards[i] += per_drone
+                            exploration_contrib[i] += per_drone
                         self.cell_rewards[gx, gy] = 0
                 else:
                     # Regenerate reward for unseen cells
@@ -377,7 +435,7 @@ class DroneEnv(gym.Env):
                 edge_penalty = edge_penalty_scale * np.exp(-edge_penalty_alpha * min_dist)
                 rewards[i] -= edge_penalty
 
-        # --- Custom penalties and exploration bonus ---
+    # --- Custom penalties and exploration bonus ---
         # Track previous positions for each drone
         if not hasattr(self, 'prev_positions'):
             self.prev_positions = [None for _ in range(self.n_drones)]
@@ -389,8 +447,9 @@ class DroneEnv(gym.Env):
             # Penalty for staying in the same place for too long
             if self.prev_positions[i] is not None:
                 movement = np.linalg.norm(pos - self.prev_positions[i])
-                if movement < 0.15:  # Increased threshold for 'staying still'
-                    rewards[i] -= 10
+                # Reduced movement penalty to avoid large accumulated negatives
+                if movement < 0.15:  # threshold for 'staying still'
+                    rewards[i] -= 1.0
 
             self.prev_positions[i] = pos.copy()
             # Exploration bonus for discovering new fires
@@ -398,11 +457,62 @@ class DroneEnv(gym.Env):
                 dist_to_fire = np.linalg.norm(pos - fc)
                 if dist_to_fire < (self.fire_radius + self.safety_margin + 1.0):
                     if idx not in self.fires_visited[i]:
-                        rewards[i] += 100
+                        bonus = 20.0
+                        rewards[i] += EXPL_WEIGHT * bonus
+                        exploration_contrib[i] += EXPL_WEIGHT * bonus
                         self.fires_visited[i].add(idx)
 
+        # Small per-step energy penalty computed from change in action (Δa) to encourage smooth control
+        # This reduces penalizing necessary baseline thrust and avoids driving agent to trivially low-action policies.
+        energy_coeff = ENERGY_COEF
+        # maintain EMA baseline for energy if not present
+        if not hasattr(self, 'energy_ema'):
+            self.energy_ema = 0.0
+            # faster-moving baseline so typical energy magnitudes are tracked quickly
+            self.energy_ema_alpha = 0.02
+        # Ensure info exists before we write into it
+        if not isinstance(locals().get('info', None), dict):
+            info = {}
+        if 'energy' not in info:
+            info['energy'] = [0.0 for _ in range(self.n_drones)]
+        # Track per-step energy components separately so logging can be precise
+        energy_components = [0.0 for _ in range(self.n_drones)]
+        for i in range(self.n_drones):
+            try:
+                a = np.clip(actions[i], -1.0, 1.0)
+                # If prev action exists, penalize change in action; else use current magnitude as proxy
+                if hasattr(self, 'prev_actions') and self.prev_actions[i] is not None:
+                    da = a - self.prev_actions[i]
+                else:
+                    da = a
+                # energy measured as mean absolute delta (lower variance than squared)
+                energy_raw = energy_coeff * float(np.mean(np.abs(da)))
+                # update EMA baseline
+                self.energy_ema = (1 - self.energy_ema_alpha) * self.energy_ema + self.energy_ema_alpha * energy_raw
+                energy_rel = energy_raw - self.energy_ema
+                # Clip to avoid huge single-step penalties
+                energy_rel = float(np.clip(energy_rel, -ENERGY_CLIP, ENERGY_CLIP))
+                # Subtract weighted penalty
+                energy_penalty = ENERGY_WEIGHT * energy_rel
+                rewards[i] -= energy_penalty
+                # record for logging (store raw and relative versions)
+                energy_components[i] = float(energy_raw)
+                # Keep legacy 'energy' key as raw magnitude for downstream logging
+                info['energy'][i] = float(energy_raw)
+            except Exception:
+                energy_components[i] = float('nan')
+                info['energy'][i] = float('nan')
+
+        # persist prev_actions for next step
+        if not hasattr(self, 'prev_actions'):
+            self.prev_actions = [None for _ in range(self.n_drones)]
+        for i in range(self.n_drones):
+            self.prev_actions[i] = np.clip(actions[i], -1.0, 1.0)
+
         self.done = dones
-        return self._get_obs(), rewards, dones, False, {}
+        # Attach the component breakdown for downstream logging: exploration, proximity, energy
+        info.update({'exploration_contrib': exploration_contrib, 'proximity_contrib': proximity_contrib, 'energy': energy_components})
+        return self._get_obs(), rewards, dones, False, info
 
     def render(self, drone_pos=None, fire_centers=None):
         # 3D visualization using matplotlib
@@ -538,27 +648,70 @@ class DroneEnv(gym.Env):
 
 # --- TD3 AGENT WITH aPE2 ACTION SELECTION ---
 class Actor(nn.Module):
-    def __init__(self, obs_dim, act_dim):
+    def __init__(self, obs_dim, act_dim, hidden=128):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(obs_dim, 64), nn.ReLU(),
-            nn.Linear(64, 64), nn.ReLU(),
-            nn.Linear(64, act_dim), nn.Tanh()  # output in [-1,1]
+            nn.Linear(obs_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, act_dim), nn.Tanh()  # output in [-1,1]
         )
     def forward(self, obs):
         return self.net(obs)
 
 class Critic(nn.Module):
-    def __init__(self, obs_dim, act_dim):
+    def __init__(self, obs_dim, act_dim, hidden=128):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(obs_dim + act_dim, 64), nn.ReLU(),
-            nn.Linear(64, 64), nn.ReLU(),
-            nn.Linear(64, 1)
+            nn.Linear(obs_dim + act_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, 1)
         )
     def forward(self, obs, act):
         x = torch.cat([obs, act], dim=-1)
         return self.net(x)
+
+
+# Simple per-component running normalizer (Welford) for proximity/exploration/energy
+class RewardNormalizer:
+    def __init__(self, warmup=N_WARMUP_TRANSITIONS, clip=3.0):
+        self.names = ['prox', 'expl', 'energy']
+        self.counts = {n: 0 for n in self.names}
+        self.means = {n: 0.0 for n in self.names}
+        self.M2 = {n: 0.0 for n in self.names}
+        self.warmup = warmup
+        self.clip = clip
+
+    def update(self, prox, expl, energy):
+        vals = {'prox': float(prox), 'expl': float(expl), 'energy': float(energy)}
+        for n in self.names:
+            x = vals[n]
+            self.counts[n] += 1
+            if self.counts[n] == 1:
+                self.means[n] = x
+                self.M2[n] = 0.0
+            else:
+                delta = x - self.means[n]
+                self.means[n] += delta / self.counts[n]
+                delta2 = x - self.means[n]
+                self.M2[n] += delta * delta2
+
+    def ready(self):
+        # ready when all components have at least warmup samples
+        return all(self.counts[n] >= self.warmup for n in self.names)
+
+    def normalize(self, prox, expl, energy):
+        vals = {'prox': float(prox), 'expl': float(expl), 'energy': float(energy)}
+        out = {}
+        for n in self.names:
+            if self.counts[n] > 1:
+                var = self.M2[n] / max(1, (self.counts[n] - 1))
+                std = (var ** 0.5) if var > 0 else 1.0
+                z = (vals[n] - self.means[n]) / (std + 1e-8)
+                z = float(max(-self.clip, min(self.clip, z)))
+            else:
+                z = float(vals[n])
+            out[n] = z
+        return out['prox'], out['expl'], out['energy']
 
 class ReplayBuffer:
     def __init__(self, size, obs_dim, act_dim):
@@ -581,13 +734,15 @@ class ReplayBuffer:
             self.full = True
     def sample(self, batch_size):
         max_i = self.size if self.full else self.ptr
+        if max_i == 0:
+            raise ValueError("Replay buffer is empty")
         idx = np.random.randint(0, max_i, size=batch_size)
         return (
-            torch.tensor(self.obs[idx]),
-            torch.tensor(self.act[idx]),
-            torch.tensor(self.rew[idx]),
-            torch.tensor(self.next_obs[idx]),
-            torch.tensor(self.done[idx])
+            torch.tensor(self.obs[idx], dtype=torch.float32),
+            torch.tensor(self.act[idx], dtype=torch.float32),
+            torch.tensor(self.rew[idx], dtype=torch.float32),
+            torch.tensor(self.next_obs[idx], dtype=torch.float32),
+            torch.tensor(self.done[idx], dtype=torch.float32)
         )
 
 class TD3Agent:
@@ -646,7 +801,10 @@ class TD3Agent:
     def decay_noise(self, decay_rate=0.99, min_noise=0.01):
         """Decay the noise levels by decay_rate, not going below min_noise."""
         self.noise_levels = [max(n * decay_rate, min_noise) for n in self.noise_levels]
-    def __init__(self, area_size, drone_radius, fire_line, fire_radius, safety_margin, max_step_size, obs_dim=7, act_dim=3, n_critics=2, n_candidates=20, noise_levels=[0.05,0.1,0.15,0.25], gamma=0.95, tau=0.005, policy_noise=0.1, noise_clip=0.2, policy_delay=2, buffer_size=100000, batch_size=128):
+    def __init__(self, area_size, drone_radius, fire_line, fire_radius, safety_margin, max_step_size, obs_dim=7, act_dim=3, n_critics=2, n_candidates=30, noise_levels=None, gamma=0.95, tau=0.005, policy_noise=0.12, noise_clip=0.25, policy_delay=2, buffer_size=200000, batch_size=2048, hidden_size=384):
+        if noise_levels is None:
+            # stronger initial candidate noise for exploration
+            noise_levels = [0.1, 0.2, 0.3, 0.5]
         self.area_size = area_size
         self.drone_radius = drone_radius
         self.fire_line = np.array(fire_line)
@@ -655,15 +813,18 @@ class TD3Agent:
         self.max_step_size = max_step_size
         self.obs_dim = obs_dim
         self.act_dim = act_dim
-        self.actor = Actor(self.obs_dim, self.act_dim)
-        self.actor_target = Actor(self.obs_dim, self.act_dim)
+        # Actor / Critic networks
+        self.actor = Actor(self.obs_dim, self.act_dim, hidden=hidden_size)
+        self.actor_target = Actor(self.obs_dim, self.act_dim, hidden=hidden_size)
         self.actor_target.load_state_dict(self.actor.state_dict())
-        self.critics = nn.ModuleList([Critic(self.obs_dim, self.act_dim) for _ in range(n_critics)])
-        self.critics_target = nn.ModuleList([Critic(self.obs_dim, self.act_dim) for _ in range(n_critics)])
+        self.critics = nn.ModuleList([Critic(self.obs_dim, self.act_dim, hidden=hidden_size) for _ in range(n_critics)])
+        self.critics_target = nn.ModuleList([Critic(self.obs_dim, self.act_dim, hidden=hidden_size) for _ in range(n_critics)])
         for i in range(n_critics):
             self.critics_target[i].load_state_dict(self.critics[i].state_dict())
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=3e-4)
-        self.critic_opts = [torch.optim.Adam(c.parameters(), lr=1e-3) for c in self.critics]
+        # Reduce actor/critic learning rates for stability
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=1e-4)
+        # Lower critic LR to stabilize training further
+        self.critic_opts = [torch.optim.Adam(c.parameters(), lr=5e-5) for c in self.critics]
         self.buffer = ReplayBuffer(buffer_size, self.obs_dim, self.act_dim)
         self.gamma = gamma
         self.tau = tau
@@ -674,7 +835,25 @@ class TD3Agent:
         self.n_candidates = n_candidates
         self.noise_levels = noise_levels
         self.total_it = 0
+        # Running reward normalization (Welford's algorithm)
+        self.r_count = 0
+        self.r_mean = 0.0
+        self.r_M2 = 0.0
     def select_action(self, obs_np):
+        # default: stochastic candidate-based selection
+        return self._select_action_candidates(obs_np, stochastic=True)
+
+    def select_action(self, obs_np, deterministic=False):
+        """Public API: return action. If deterministic=True, use raw actor output without candidate sampling."""
+        if deterministic:
+            obs = torch.tensor(obs_np, dtype=torch.float32).unsqueeze(0)
+            with torch.no_grad():
+                a = self.actor(obs).cpu().numpy()[0]
+            return np.clip(a, -1, 1)
+        else:
+            return self._select_action_candidates(obs_np, stochastic=True)
+
+    def _select_action_candidates(self, obs_np, stochastic=True):
         obs = torch.tensor(obs_np, dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():
             base_action = self.actor(obs).cpu().numpy()[0]
@@ -763,22 +942,22 @@ class TD3Agent:
             dist = point_to_segment_dist(sim_pos, self.fire_line[0], self.fire_line[1])
             min_safe_dist = self.drone_radius + self.fire_radius + self.safety_margin
             collision_dist = self.drone_radius + self.fire_radius
-            
+
             if dist <= collision_dist:
-                immediate_reward = -200
+                immediate_reward = COLLISION_PENALTY
             elif dist <= min_safe_dist:
                 danger_factor = (min_safe_dist - dist) / (min_safe_dist - collision_dist)
-                immediate_reward = -50 * (danger_factor ** 2)
+                immediate_reward = - (PROXIMITY_SCALE * 2.0) * (danger_factor ** 2)
             else:
                 safe_distance = dist - min_safe_dist
                 alpha = 1.2
-                proximity_scale = 200.0
+                proximity_scale = PROXIMITY_SCALE
                 immediate_reward = proximity_scale * np.exp(-alpha * safe_distance)
-                
-                # Add optimal range bonus
+
+                # Add small optimal range bonus
                 optimal_range = 0.3
                 if safe_distance <= optimal_range:
-                    optimal_bonus = 100 * (1 - safe_distance / optimal_range)
+                    optimal_bonus = 20 * (1 - safe_distance / optimal_range)
                     immediate_reward += optimal_bonus
             
             # Long-term Q (average over critics)
@@ -787,19 +966,83 @@ class TD3Agent:
             q_vals = [critic(obs_t, act_t).item() for critic in self.critics]
             avg_q = np.mean(q_vals)
             
-            # Weighted score: immediate + gamma * avg_q
-            score = immediate_reward + self.gamma * avg_q
+            # Estimate candidate energy (squared delta of action magnitude relative to zero)
+            est_energy = float(np.sum(a ** 2) / max(1, a.size))
+            # Weighted score: immediate reward + discounted Q - small energy penalty
+            energy_penalty_est = ENERGY_WEIGHT * est_energy * 1.0  # stronger estimated penalty
+            score = immediate_reward + self.gamma * avg_q - energy_penalty_est
             scores.append(score)
         
         best_idx = int(np.argmax(scores))
-        return candidates[best_idx]
+        # Pick best candidate (avoid averaging that cancels directional components)
+        try:
+            return np.clip(np.array(candidates[best_idx], dtype=np.float32), -1, 1)
+        except Exception:
+            return np.clip(candidates[best_idx], -1, 1)
     def store(self, o, a, r, no, d):
-        self.buffer.add(o, a, r, no, d)
+        # Store raw clipped reward in buffer. We will normalize on-the-fly in train()
+        try:
+            raw = float(r)
+            clipped = float(np.clip(raw, -REWARD_CLIP, REWARD_CLIP))
+        except Exception:
+            clipped = float(r)
+
+        # Add raw clipped reward to replay buffer
+        self.buffer.add(o, a, clipped, no, d)
+
+        # If we have not yet initialized running stats and the buffer now has enough
+        # transitions, initialize Welford moments from buffer contents
+        max_i = self.buffer.size if self.buffer.full else self.buffer.ptr
+        if self.r_count == 0 and max_i >= N_WARMUP_TRANSITIONS:
+            data = np.array(self.buffer.rew[:max_i], dtype=np.float64)
+            if data.size == 0:
+                # fallback to the single clipped sample
+                data = np.array([clipped], dtype=np.float64)
+            self.r_count = int(data.size)
+            self.r_mean = float(np.mean(data))
+            self.r_M2 = float(np.sum((data - self.r_mean) ** 2))
+
+        # If running stats are initialized, update them with the new raw clipped reward
+        if self.r_count > 0:
+            x = float(clipped)
+            self.r_count += 1
+            if self.r_count == 1:
+                self.r_mean = x
+                self.r_M2 = 0.0
+            else:
+                delta = x - self.r_mean
+                self.r_mean += delta / self.r_count
+                delta2 = x - self.r_mean
+                self.r_M2 += delta * delta2
+            if self.r_count > 1:
+                r_std = (self.r_M2 / (self.r_count - 1)) ** 0.5
+            else:
+                r_std = 1.0
+            try:
+                last_norm = float((clipped - self.r_mean) / (r_std + 1e-8))
+                last_norm = float(np.clip(last_norm, -NORMALIZED_REWARD_CLIP, NORMALIZED_REWARD_CLIP))
+                self.last_normalized_reward = last_norm
+            except Exception:
+                self.last_normalized_reward = float('nan')
+        else:
+            # Not normalizing yet; report clipped raw reward for logging
+            self.last_normalized_reward = float(clipped)
     def train(self):
-        if self.buffer.ptr < self.batch_size:
+        # Require sufficient buffer fill and warmup transitions before training
+        max_i = self.buffer.size if self.buffer.full else self.buffer.ptr
+        if max_i < max(self.batch_size * 10, N_WARMUP_TRANSITIONS):
             return
         self.total_it += 1
-        o, a, r, no, d = self.buffer.sample(self.batch_size)
+        o, a, r_raw, no, d = self.buffer.sample(self.batch_size)
+        # Normalize rewards on-the-fly if running stats are available
+        with torch.no_grad():
+            if self.r_count > 1:
+                r_mean = torch.tensor(self.r_mean, dtype=torch.float32)
+                r_std = torch.tensor((self.r_M2 / (self.r_count - 1)) ** 0.5, dtype=torch.float32)
+                r = (r_raw - r_mean) / (r_std + 1e-8)
+                r = torch.clamp(r, -float(NORMALIZED_REWARD_CLIP), float(NORMALIZED_REWARD_CLIP))
+            else:
+                r = r_raw
         with torch.no_grad():
             # Target policy smoothing
             noise = (torch.randn_like(a) * self.policy_noise).clamp(-self.noise_clip, self.noise_clip)
@@ -809,19 +1052,85 @@ class TD3Agent:
             target_qs = [ct(no, next_a) for ct in self.critics_target]
             min_target_q = torch.min(torch.stack(target_qs, dim=0), dim=0)[0]
             target = r + self.gamma * (1 - d) * min_target_q
+            # Clamp targets to avoid extreme updates
+            target = torch.clamp(target, -float(TARGET_CLIP), float(TARGET_CLIP))
+        # record last normalized reward for diagnostics
+        try:
+            self.last_normalized_reward = float(r.mean().item())
+        except Exception:
+            self.last_normalized_reward = float('nan')
         # Critic update
+        critic_losses = []
+        td_errors = []
+        q_mins = []
+        q_maxs = []
+        critic_grad_norms = []
         for i, critic in enumerate(self.critics):
             q = critic(o, a)
-            loss = nn.MSELoss()(q, target)
+            # TD-error per sample (target - q)
+            with torch.no_grad():
+                td = (target - q)
+                # store mean absolute td-error for this critic
+                td_errors.append(float(td.abs().mean().item()))
+                q_mins.append(float(q.min().item()))
+                q_maxs.append(float(q.max().item()))
+            # Use Huber (Smooth L1) for robustness to outliers
+            loss = nn.SmoothL1Loss()(q, target)
+            critic_losses.append(loss.item())
             self.critic_opts[i].zero_grad()
             loss.backward()
+            # Gradient clipping to avoid huge updates and record grad norm
+            try:
+                gn = torch.nn.utils.clip_grad_norm_(critic.parameters(), GRAD_CLIP_NORM)
+                critic_grad_norms.append(float(gn))
+            except Exception:
+                critic_grad_norms.append(float('nan'))
             self.critic_opts[i].step()
+        # store last critic/td diagnostics for logging
+        try:
+            self.last_critic_loss = float(sum(critic_losses) / len(critic_losses))
+        except Exception:
+            self.last_critic_loss = float('nan')
+        try:
+            self.last_td_error = float(sum(td_errors) / len(td_errors))
+        except Exception:
+            self.last_td_error = float('nan')
+        try:
+            self.last_q_min = float(sum(q_mins) / len(q_mins))
+            self.last_q_max = float(sum(q_maxs) / len(q_maxs))
+        except Exception:
+            self.last_q_min = float('nan')
+            self.last_q_max = float('nan')
+        try:
+            # Average critic grad norm for logging
+            self.last_critic_grad_norm = float(np.nanmean(critic_grad_norms)) if critic_grad_norms else float('nan')
+        except Exception:
+            self.last_critic_grad_norm = float('nan')
         # Delayed policy update
         if self.total_it % self.policy_delay == 0:
-            actor_loss = -self.critics[0](o, self.actor(o)).mean()
+            # Actor loss with small L2 penalty on actions to discourage saturation
+            pred_actions = self.actor(o)
+            actor_loss = -self.critics[0](o, pred_actions).mean()
+            actor_loss = actor_loss + ACT_REG * (pred_actions ** 2).mean()
+            # Small actor-side energy regularizer (mean absolute action magnitude)
+            try:
+                actor_loss = actor_loss + ENERGY_ACT_REG * torch.mean(torch.abs(pred_actions))
+            except Exception:
+                pass
             self.actor_opt.zero_grad()
             actor_loss.backward()
+            # Clip actor grads too
+            try:
+                agn = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), GRAD_CLIP_NORM)
+                self.last_actor_grad_norm = float(agn)
+            except Exception:
+                self.last_actor_grad_norm = float('nan')
             self.actor_opt.step()
+            # store last actor loss
+            try:
+                self.last_actor_loss = float(actor_loss.item())
+            except Exception:
+                self.last_actor_loss = float('nan')
             # Polyak averaging
             for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
                 target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
@@ -852,9 +1161,7 @@ def main():
     # Ask user if they want to see visualization at the end of each scenario
     vis_input = input("Show visualization at the end of each scenario? (y/n): ").strip().lower()
     show_vis_each = vis_input == 'y'
-    num_scenarios = len(scenarios)
-    num_episodes = 25  # Total episodes per scenario
-    curriculum_episodes = 1  # Episodes per curriculum level zzz
+    curriculum_episodes = 10  # Episodes per curriculum level zzz
 
     episode_rewards = [[], []]  # Store total points per episode for each drone
     avg_fire_distances = [[], []]  # Track average distance to fire per episode
@@ -874,6 +1181,9 @@ def main():
         act_dim=act_dim
     ) for _ in range(env.n_drones)]
 
+    # Per-component normalizer for logging and optional normalization
+    reward_normalizer = RewardNormalizer(warmup=N_WARMUP_TRANSITIONS, clip=3.0)
+
     # Prepare logs directory and CSV files (overwrite existing logs for a fresh run)
     logs_dir = Path("logs")
     logs_dir.mkdir(exist_ok=True)
@@ -882,13 +1192,27 @@ def main():
     # Open and write headers
     training_fp = open(training_csv_path, 'w', newline='')
     training_writer = csv.writer(training_fp)
-    training_writer.writerow(["episode", "total_reward", "length", "success", "collisions", "avg_goal_dist", "crash_types"])
+    training_writer.writerow(["episode", "total_reward", "length", "success", "collisions", "avg_goal_dist", "crash_types", "proximity_component", "exploration_component", "energy_component", "normalized_total", "norm_prox_mean", "norm_expl_mean", "norm_energy_mean", "action_saturation_fraction", "actor_loss", "critic_loss", "td_error"])
 
     steps_fp = open(steps_csv_path, 'w', newline='')
     steps_writer = csv.writer(steps_fp)
-    steps_writer.writerow(["episode", "step", "x", "y", "z", "action0", "action1", "action2", "reward", "td_error", "rule_override"])
+    # Add per-step components: exploration_reward, proximity_reward and per-step td_error
+    steps_writer.writerow(["episode", "step", "x", "y", "z", "action0", "action1", "action2", "reward", "exploration_reward", "proximity_reward", "energy", "exploration_norm", "proximity_norm", "energy_norm", "normalized_reward", "td_error", "action_saturation", "rule_override"])
+
+    # Per-update diagnostics (agent training updates)
+    updates_csv_path = logs_dir / "updates.csv"
+    updates_fp = open(updates_csv_path, 'w', newline='')
+    updates_writer = csv.writer(updates_fp)
+    # include normalized reward and grad norms for debugging
+    updates_writer.writerow(["episode", "step", "agent_id", "total_it", "actor_loss", "critic_loss", "td_error", "q_min", "q_max", "normalized_reward", "actor_grad_norm", "critic_grad_norm", "replay_fill"])
 
     global_episode_counter = 0
+    # global step counter for warm-up and scheduling
+    global_step = 0
+    # number of environment steps to populate replay buffer with random actions before training
+    start_timesteps = 5000
+    # reward scaling for training (we now use agent-side normalization, so set to 1.0)
+    reward_scale = 1.0
 
     # Ask user if they want to load previous training or start from scratch
     load_choice = input("Load previous training from pickle file? (y/n): ").strip().lower()
@@ -941,13 +1265,17 @@ def main():
                     actions = np.zeros((env.n_drones, 3))
                     for i in range(env.n_drones):
                         if not done[i]:
-                            actions[i] = agents[i].select_action(obs[i])
+                            # During warmup choose random actions to fill buffer
+                            if global_step < start_timesteps:
+                                actions[i] = np.random.uniform(-1, 1, size=(3,))
+                            else:
+                                actions[i] = agents[i].select_action(obs[i])
 
                     # Store action and state before step for logging/visualization
                     episode_actions.append(np.copy(actions))
                     episode_states.append(np.copy(obs[:, :3]))
 
-                    next_obs, rewards, done, _, _ = env.step(actions, seen_grids=seen_grids)
+                    next_obs, rewards, done, _, info = env.step(actions, seen_grids=seen_grids)
 
                     # Store post-step info
                     if env.scenario == 2:
@@ -986,13 +1314,116 @@ def main():
                         seen_areas[i].append((drone_xy[0], drone_xy[1], view_radius))
 
                     for i in range(env.n_drones):
-                        agents[i].store(obs[i], actions[i], rewards[i], next_obs[i], float(done[i]))
+                        # Clamp raw reward and pass clipped raw reward to agent (agent will normalize)
+                        raw_r = float(rewards[i])
+                        r_clamped = float(np.clip(raw_r, -REWARD_CLIP, REWARD_CLIP))
+                        r_for_buffer = r_clamped * reward_scale
+                        # Update per-component normalizer if env returned breakdown
+                        try:
+                            prox_val = float(info.get('proximity_contrib', [float('nan')])[i]) if info is not None else float('nan')
+                            expl_val = float(info.get('exploration_contrib', [float('nan')])[i]) if info is not None else float('nan')
+                            energy_val = float(info.get('energy', [float('nan')])[i]) if info is not None else float('nan')
+                        except Exception:
+                            prox_val = expl_val = energy_val = float('nan')
+                        # Update running stats
+                        try:
+                            reward_normalizer.update(prox_val, expl_val, energy_val)
+                        except Exception:
+                            pass
+                        # If the per-component normalizer is ready, use normalized components to form a scaled reward for buffer
+                        normalized_total = None
+                        exploration_norm = proximity_norm = energy_norm = float('nan')
+                        try:
+                            if reward_normalizer.ready():
+                                p_n, e_n, en_n = reward_normalizer.normalize(prox_val, expl_val, energy_val)
+                                # Keep consistent naming: prox, expl, energy
+                                proximity_norm = float(p_n)
+                                exploration_norm = float(e_n)
+                                energy_norm = float(en_n)
+                                # Recompose normalized total according to component weights
+                                # Add small shaped bonus proportional to proximity (encourages moving closer to safe/optimal band)
+                                shaped_goal_bonus = 0.8 * max(0.0, proximity_norm)
+                                normalized_total = PROX_WEIGHT * proximity_norm + EXPL_WEIGHT * exploration_norm - ENERGY_WEIGHT * energy_norm + shaped_goal_bonus
+                                # Clip normalized total to avoid extreme values
+                                normalized_total = float(np.clip(normalized_total, -float(NORMALIZED_REWARD_CLIP), float(NORMALIZED_REWARD_CLIP)))
+                        except Exception:
+                            normalized_total = None
+
+                        # Decide what to store in buffer: prefer normalized_total when available, else raw clipped reward
+                        if normalized_total is not None:
+                            r_buffer = float(normalized_total)
+                        else:
+                            r_buffer = r_for_buffer
+
+                        # Store the reward used for training in the agent's buffer
+                        agents[i].store(obs[i], actions[i], r_buffer, next_obs[i], float(done[i]))
+                        # Attempt a training step; agent.train() will gate on warmup internally
                         agents[i].train()
-                        total_reward[i] += rewards[i]
+                        # Write per-update diagnostics if the agent produced them
+                        try:
+                            updates_writer.writerow([
+                                global_episode_counter,
+                                steps,
+                                i,
+                                agents[i].total_it,
+                                getattr(agents[i], 'last_actor_loss', float('nan')),
+                                getattr(agents[i], 'last_critic_loss', float('nan')),
+                                getattr(agents[i], 'last_td_error', float('nan')),
+                                getattr(agents[i], 'last_q_min', float('nan')),
+                                getattr(agents[i], 'last_q_max', float('nan')),
+                                getattr(agents[i], 'last_normalized_reward', float('nan')),
+                                getattr(agents[i], 'last_actor_grad_norm', float('nan')),
+                                getattr(agents[i], 'last_critic_grad_norm', float('nan')),
+                                getattr(agents[i].buffer, 'ptr', float('nan'))
+                            ])
+                            try:
+                                updates_fp.flush()
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+                        # Use the clamped raw reward for human-readable episode totals, but also track normalized totals
+                        total_reward[i] += r_clamped
+                        if normalized_total is not None:
+                            # track a separate normalized episode total (create attribute if needed)
+                            if not hasattr(agents[i], 'episode_normalized_total'):
+                                agents[i].episode_normalized_total = 0.0
+                            agents[i].episode_normalized_total += float(normalized_total)
+                        # store per-step normalized comps for later CSV logging
+                        try:
+                            if 'episode_normalized_components' not in locals():
+                                episode_normalized_components = [[] for _ in range(env.n_drones)]
+                        except Exception:
+                            episode_normalized_components = [[] for _ in range(env.n_drones)]
+                        try:
+                            episode_normalized_components[i].append((exploration_norm, proximity_norm, energy_norm, normalized_total))
+                        except Exception:
+                            episode_normalized_components[i].append((float('nan'), float('nan'), float('nan'), float('nan')))
+                        # If env provided component breakdown in info, record for logging
+                        try:
+                            # info may contain 'exploration_contrib', 'proximity_contrib', and 'energy'
+                            if isinstance(info, dict):
+                                if 'exploration_contrib' in info:
+                                    # per-drone contributions list
+                                    exploration_val = float(info['exploration_contrib'][i]) if len(info['exploration_contrib']) > i else float('nan')
+                                else:
+                                    exploration_val = float('nan')
+                                if 'proximity_contrib' in info:
+                                    proximity_val = float(info['proximity_contrib'][i]) if len(info['proximity_contrib']) > i else float('nan')
+                                else:
+                                    proximity_val = float('nan')
+                                if 'energy' in info:
+                                    energy_val = float(info['energy'][i]) if len(info['energy']) > i else float('nan')
+                                else:
+                                    energy_val = float('nan')
+                            else:
+                                exploration_val = proximity_val = energy_val = float('nan')
+                        except Exception:
+                            exploration_val = proximity_val = energy_val = float('nan')
                         # Detect crash type with clearer messages
                         if done[i] and crash_type[i] is None:
                             if env.scenario == 5:
-                                if rewards[i] <= -100:
+                                if rewards[i] <= COLLISION_PENALTY:
                                     # Check if random crash or wall
                                     prev_x = obs[i][0]
                                     new_x = next_obs[i][0]
@@ -1003,7 +1434,7 @@ def main():
                                     else:
                                         crash_type[i] = 'random ground crash (1% chance)'
                             else:
-                                if rewards[i] <= -100:
+                                if rewards[i] <= COLLISION_PENALTY:
                                     # Check if crashed into fire or other drone
                                     if done[0] and done[1] and np.linalg.norm(next_obs[0][:3] - next_obs[1][:3]) < 2*env.drone_radius + env.safety_margin + 1e-3:
                                         crash_type[0] = crash_type[1] = 'drone-drone collision'
@@ -1012,6 +1443,7 @@ def main():
 
                     obs = next_obs
                     steps += 1
+                    global_step += 1
 
                 # Save last episode's states for visualization
                 if curriculum_level == 4 and episode == curriculum_episodes - 1:
@@ -1033,8 +1465,44 @@ def main():
                 # Increment global episode counter and log
                 global_episode_counter += 1
 
-                # Determine success & collisions heuristically (reward <= -100 considered collision/failure)
-                collisions = sum(1 for r in total_reward if r <= -100)
+                # Periodic deterministic evaluation (every 5 episodes)
+                if global_episode_counter % 5 == 0:
+                    # Run a single deterministic episode for agents and log
+                    eval_env = DroneEnv(curriculum_level=curriculum_level, scenario=scenario)
+                    eval_obs, _ = eval_env.reset()
+                    eval_done = [False, False]
+                    eval_steps = 0
+                    eval_total = [0.0, 0.0]
+                    while not all(eval_done) and eval_steps < 300:
+                        eval_actions = np.zeros((eval_env.n_drones, 3))
+                        for ai in range(eval_env.n_drones):
+                            if not eval_done[ai]:
+                                eval_actions[ai] = agents[ai].select_action(eval_obs[ai], deterministic=True)
+                        eval_next_obs, eval_rewards, eval_done, _, _ = eval_env.step(eval_actions)
+                        for ai in range(eval_env.n_drones):
+                            eval_total[ai] += float(np.clip(eval_rewards[ai], -REWARD_CLIP, REWARD_CLIP))
+                        eval_obs = eval_next_obs
+                        eval_steps += 1
+                    # Write eval metrics
+                    eval_path = logs_dir / "eval_metrics.csv"
+                    write_header = not eval_path.exists()
+                    with open(eval_path, 'a', newline='') as efp:
+                        ew = csv.writer(efp)
+                        if write_header:
+                            ew.writerow(["episode", "scenario", "curriculum_level", "eval_steps", "eval_total_reward", "eval_avg_reward", "eval_success"])
+                        ev_success = 1 if sum(1 for r in eval_total if r > COLLISION_PENALTY) == eval_env.n_drones else 0
+                        ew.writerow([global_episode_counter, scenario, curriculum_level, eval_steps, float(np.mean(eval_total)), float(np.mean(eval_total)), ev_success])
+
+                # Determine success & collisions heuristically. Use crash_type where available.
+                collisions = 0
+                for i in range(env.n_drones):
+                    ct = crash_type[i]
+                    if ct is not None and ('collision' in ct or 'crash' in ct or 'fire' in ct or 'wall' in (ct or '')):
+                        collisions += 1
+                    else:
+                        # Fallback: if total_reward very low below collision penalty, count as collision
+                        if total_reward[i] <= COLLISION_PENALTY:
+                            collisions += 1
                 success = 1 if collisions == 0 else 0
                 # Average goal distance (use avg_fire_distances if available)
                 try:
@@ -1042,14 +1510,145 @@ def main():
                 except Exception:
                     avg_goal_dist = float('nan')
 
-                training_writer.writerow([global_episode_counter, float(np.mean(total_reward)), int(steps), success, int(collisions), float(avg_goal_dist), ";".join([str(ct) for ct in crash_type])])
+                # If the episode ended due to timeout, apply the timeout penalty once to the total reward
+                for i in range(env.n_drones):
+                    if crash_type[i] == 'timeout':
+                        # Subtract timeout penalty once (timeouts are less severe than collisions)
+                        episode_rewards[i] = [r for r in episode_rewards[i]]
+                        total_reward[i] += TIMEOUT_PENALTY
+
+                # Include last actor/critic/td diagnostics if available
+                actor_loss_log = float('nan')
+                critic_loss_log = float('nan')
+                td_error_log = float('nan')
+                try:
+                    # Use agent 0 diagnostics as representative
+                    actor_loss_log = agents[0].last_actor_loss if hasattr(agents[0], 'last_actor_loss') else float('nan')
+                    critic_loss_log = agents[0].last_critic_loss if hasattr(agents[0], 'last_critic_loss') else float('nan')
+                    td_error_log = agents[0].last_td_error if hasattr(agents[0], 'last_td_error') else float('nan')
+                except Exception:
+                    pass
+
+                # Aggregate last-step approximate components for logging (best-effort)
+                prox_comp = float(np.nan)
+                expl_comp = float(np.nan)
+                try:
+                    # If we recorded proximity/exploration contributions per step in env info, use last
+                    last_info = None
+                    # Some code paths append per-step info to episode_rewards_per_step as tuples
+                    if episode_rewards_per_step and isinstance(episode_rewards_per_step[-1][0], (list, tuple)):
+                        prox_comp = float(episode_rewards_per_step[-1][0][0])
+                        expl_comp = float(episode_rewards_per_step[-1][0][1])
+                except Exception:
+                    pass
+                # Energy component: best-effort extract from last info stored in episode arrays if available
+                energy_comp = float(np.nan)
+                try:
+                    if episode_rewards_per_step and len(episode_rewards_per_step[-1]) >= 3:
+                        # If last entry contains breakdown (prox, expl, energy), try to use it
+                        last_entry = episode_rewards_per_step[-1][0]
+                        if isinstance(last_entry, (list, tuple)) and len(last_entry) >= 3:
+                            energy_comp = float(last_entry[2])
+                except Exception:
+                    energy_comp = float('nan')
+
+                # Aggregate normalized components per episode if available
+                try:
+                    norm_prox_sum = float('nan')
+                    norm_expl_sum = float('nan')
+                    norm_energy_sum = float('nan')
+                    norm_total = float('nan')
+                    if 'episode_normalized_components' in locals():
+                        # Sum across steps for drone 0 only (consistent with other per-step logging)
+                        vals = episode_normalized_components[0]
+                        if vals:
+                            arr = np.array(vals, dtype=np.float32)
+                            # columns: exploration_norm, proximity_norm, energy_norm, normalized_total
+                            norm_expl_sum = float(np.nansum(arr[:, 0]))
+                            norm_prox_sum = float(np.nansum(arr[:, 1]))
+                            norm_energy_sum = float(np.nansum(arr[:, 2]))
+                            norm_total = float(np.nansum(arr[:, 3]))
+                except Exception:
+                    norm_prox_sum = norm_expl_sum = norm_energy_sum = norm_total = float('nan')
+
+                # Compute per-episode action saturation fraction (fraction of steps where any action dim is near ±1)
+                try:
+                    sats = []
+                    for t in range(len(episode_actions)):
+                        act = episode_actions[t][0] if t < len(episode_actions) else np.array([0.0, 0.0, 0.0])
+                        sats.append(float(np.mean(np.abs(act) > 0.98)))
+                    action_saturation_fraction = float(np.nanmean(sats)) if sats else float('nan')
+                except Exception:
+                    action_saturation_fraction = float('nan')
+
+                # Compute mean normalized components over episode for drone 0
+                try:
+                    norm_prox_mean = float('nan')
+                    norm_expl_mean = float('nan')
+                    norm_energy_mean = float('nan')
+                    if 'episode_normalized_components' in locals():
+                        vals = episode_normalized_components[0]
+                        if vals:
+                            arr = np.array(vals, dtype=np.float32)
+                            norm_expl_mean = float(np.nanmean(arr[:, 0]))
+                            norm_prox_mean = float(np.nanmean(arr[:, 1]))
+                            norm_energy_mean = float(np.nanmean(arr[:, 2]))
+                except Exception:
+                    norm_prox_mean = norm_expl_mean = norm_energy_mean = float('nan')
+
+                training_writer.writerow([global_episode_counter, float(np.mean(total_reward)), int(steps), success, int(collisions), float(avg_goal_dist), ";".join([str(ct) for ct in crash_type]), prox_comp, expl_comp, energy_comp, norm_total, norm_prox_mean, norm_expl_mean, norm_energy_mean, action_saturation_fraction, actor_loss_log, critic_loss_log, td_error_log])
 
                 # Write per-step rows (log only drone 0 for compactness)
+                # When writing per-step rows, attempt to split reward into components if possible.
                 for t in range(len(episode_states)):
                     st = episode_states[t][0]
                     act = episode_actions[t][0] if t < len(episode_actions) else np.array([0.0, 0.0, 0.0])
                     reward_step = episode_rewards_per_step[t][0] if t < len(episode_rewards_per_step) else 0.0
-                    steps_writer.writerow([global_episode_counter, t, float(st[0]), float(st[1]), float(st[2]), float(act[0]), float(act[1]), float(act[2]), float(reward_step), float('nan'), 0])
+                    # Try to estimate exploration vs proximity component if we recorded seen grids or computed them
+                    exploration_comp = float('nan')
+                    proximity_comp = float('nan')
+                    # If env provided a breakdown in episode_rewards_per_step as tuples, handle that
+                    try:
+                        # Some code paths may have stored a tuple (prox, expl)
+                        if isinstance(episode_rewards_per_step[t][0], (list, tuple)) and len(episode_rewards_per_step[t][0]) >= 2:
+                            proximity_comp = float(episode_rewards_per_step[t][0][0])
+                            exploration_comp = float(episode_rewards_per_step[t][0][1])
+                    except Exception:
+                        pass
+
+                    # As a safety, clamp the recorded per-step reward to a reasonable range to avoid huge episode sums
+                    reward_step_clamped = float(np.clip(reward_step, -REWARD_CLIP, REWARD_CLIP))
+                    # Fill td_error column from agent diagnostics if available (use agent 0 as representative)
+                    td_error_val = float('nan')
+                    try:
+                        td_error_val = agents[0].last_td_error if hasattr(agents[0], 'last_td_error') else float('nan')
+                    except Exception:
+                        td_error_val = float('nan')
+                    # extract per-step energy component if env provided it in episode arrays (info not stored per-step by default)
+                    energy_val = float('nan')
+                    try:
+                        # if episode_rewards_per_step stored tuples (prox, expl) or info was preserved, try to extract energy
+                        if t < len(episode_rewards_per_step):
+                            # attempt to read from episode_rewards_per_step's associated info if available
+                            # otherwise, fallback to NaN
+                            pass
+                        # compute action_saturation metric for this step (fraction of action dims near ±1)
+                        action_saturation = float(np.mean(np.abs(act) > 0.98))
+                    except Exception:
+                        action_saturation = float('nan')
+                    # Pull per-step normalized components if available
+                    expl_norm = prox_norm = energy_norm = norm_reward_step = float('nan')
+                    try:
+                        if 'episode_normalized_components' in locals() and t < len(episode_normalized_components[0]):
+                            en = episode_normalized_components[0][t]
+                            expl_norm = float(en[0])
+                            prox_norm = float(en[1])
+                            energy_norm = float(en[2])
+                            norm_reward_step = float(en[3])
+                    except Exception:
+                        expl_norm = prox_norm = energy_norm = norm_reward_step = float('nan')
+
+                    steps_writer.writerow([global_episode_counter, t, float(st[0]), float(st[1]), float(st[2]), float(act[0]), float(act[1]), float(act[2]), reward_step_clamped, exploration_comp, proximity_comp, energy_val, expl_norm, prox_norm, energy_norm, norm_reward_step, td_error_val, action_saturation, 0])
 
                 print(f"Episode {scenario_episode}/{5 * curriculum_episodes} (Scenario {scenario}, Level {curriculum_level+1}) Total Rewards: {[round(r, 1) for r in total_reward]}")
                 for i in range(env.n_drones):
@@ -1178,7 +1777,7 @@ def main():
     max_cell_reward = env.max_cell_reward
     cell_rewards = env.cell_rewards
     alpha = 1.2  # Updated to match new parameters
-    proximity_scale = 200.0
+    proximity_scale = PROXIMITY_SCALE
     edge_penalty_scale = 50.0
     edge_penalty_alpha = 2.0
     z = 7.5  # fixed height for analysis
@@ -1215,7 +1814,7 @@ def main():
                 # Add optimal range bonus
                 optimal_range = 0.3
                 if safe_distance <= optimal_range:
-                    optimal_bonus = 100 * (1 - safe_distance / optimal_range)
+                    optimal_bonus = OPTIMAL_BONUS * (1 - safe_distance / optimal_range)
                     fire_reward += optimal_bonus
             # Edge penalty (only when very close)
             dists_edge = [pos[0], area_size - pos[0], pos[1], area_size - pos[1], pos[2] - 5, 10 - pos[2]]
@@ -1238,6 +1837,23 @@ def main():
     plt.show()
 
     # --- Save trained agents ---
+    def export_decision_map(agent, env, fname=logs_dir / "decision_map.npy", x_range=(2.5,7.5), y_range=(2.5,7.5), res=0.15):
+        # Evaluate deterministic actor on grid (no candidate noise)
+        xs = np.arange(x_range[0], x_range[1], res)
+        ys = np.arange(y_range[0], y_range[1], res)
+        grid = np.zeros((len(xs), len(ys), 3), dtype=np.float32)
+        for ix, x in enumerate(xs):
+            for iy, y in enumerate(ys):
+                # z fixed to 7.5 for decision map
+                obs = np.array([x, y, 7.5, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+                # deterministic actor
+                with torch.no_grad():
+                    act = agent.actor(torch.tensor(obs, dtype=torch.float32).unsqueeze(0)).cpu().numpy()[0]
+                grid[ix, iy] = act
+        # Save grid and axes for plotting
+        np.save(fname, {'xs': xs, 'ys': ys, 'grid': grid})
+        print(f"Wrote decision map to {fname}")
+
     save_input = input(f"Save trained agents to file? (y/n): ").strip().lower()
     if save_input == 'y':
         for i, agent in enumerate(agents):
@@ -1249,6 +1865,12 @@ def main():
                     continue
             agent.save(fname)
             print(f"Saved agent {i} to '{fname}'.")
+            # Export decision map for agent 0 only (helpful for plotting)
+            if i == 0:
+                try:
+                    export_decision_map(agent, env)
+                except Exception as e:
+                    print("Failed to export decision map:", e)
 
     # Close log files if open
     try:
@@ -1268,4 +1890,29 @@ def main():
             print("Failed to run plotting script:", e)
 
 if __name__ == "__main__":
-    main()
+    import os
+    if os.environ.get('SMOKE_RUN', '0') == '1':
+        # Minimal non-interactive smoke run for quick validation
+        def smoke_run(episodes=10):
+            env = DroneEnv(scenario=1)
+            obs, _ = env.reset()
+            agents = [TD3Agent(env.area_size, env.drone_radius, env.fire_line, env.fire_radius, env.safety_margin, env.max_step_size, obs_dim=env.observation_space.shape[1], act_dim=env.action_space.shape[1]) for _ in range(env.n_drones)]
+            for ep in range(episodes):
+                obs, _ = env.reset()
+                done = [False] * env.n_drones
+                steps = 0
+                while not all(done) and steps < 200:
+                    actions = np.zeros((env.n_drones, 3))
+                    for i in range(env.n_drones):
+                        if not done[i]:
+                            actions[i] = agents[i].select_action(obs[i])
+                    next_obs, rewards, done, _, info = env.step(actions)
+                    for i in range(env.n_drones):
+                        agents[i].store(obs[i], actions[i], float(np.clip(rewards[i], -REWARD_CLIP, REWARD_CLIP)), next_obs[i], float(done[i]))
+                        agents[i].train()
+                    obs = next_obs
+                    steps += 1
+            print('SMOKE_RUN_COMPLETE')
+        smoke_run(episodes=10)
+    else:
+        main()
