@@ -1161,7 +1161,7 @@ def main():
     # Ask user if they want to see visualization at the end of each scenario
     vis_input = input("Show visualization at the end of each scenario? (y/n): ").strip().lower()
     show_vis_each = vis_input == 'y'
-    curriculum_episodes = 10  # Episodes per curriculum level zzz
+    curriculum_episodes = 1  # Episodes per curriculum level zzz
 
     episode_rewards = [[], []]  # Store total points per episode for each drone
     avg_fire_distances = [[], []]  # Track average distance to fire per episode
