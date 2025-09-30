@@ -98,6 +98,19 @@ def plot_training_curve(df_train):
     save_fig(fig, '01_training_curve.png')
 
 
+def plot_avg_fire_distance(df_train):
+    fig, ax = plt.subplots(figsize=(9, 4))
+    if 'avg_goal_dist' in df_train.columns:
+        ax.plot(df_train['episode'], df_train['avg_goal_dist'], color='C2', alpha=0.6)
+        ax.plot(df_train['episode'], df_train['avg_goal_dist'].rolling(50, min_periods=1).mean(), color='C3', label='rolling(50)')
+        ax.set_ylabel('Average Distance to Fire')
+        ax.set_title('Average Fire Distance per Episode')
+    else:
+        ax.text(0.5, 0.5, 'avg_goal_dist not available in logs', ha='center', va='center')
+    ax.set_xlabel('Episode')
+    save_fig(fig, '01b_avg_fire_distance.png')
+
+
 def plot_length_and_success(df_train):
     fig, axs = plt.subplots(1, 2, figsize=(12, 4))
     axs[0].plot(df_train['episode'], df_train['length'], alpha=0.4)
@@ -179,7 +192,7 @@ def plot_trajectories(df_steps):
     for ep in sample_eps:
         g = df_steps[df_steps['episode'] == ep]
         ax.plot(g['x'], g['y'], alpha=0.6)
-    ax.set_title('Sample trajectories (x,y)')
+    ax.set_title('Trajectories (x,y)')
     ax.set_xlabel('x')
     ax.set_ylabel('y')
     save_fig(fig, '07_trajectories.png')
@@ -204,6 +217,19 @@ def plot_reward_components(df_train):
     ax.set_ylabel('Reward')
     ax.legend()
     save_fig(fig, '08_reward_components.png')
+
+
+def plot_normalized_total(df_train):
+    fig, ax = plt.subplots(figsize=(9, 4))
+    if 'normalized_total' in df_train.columns:
+        ax.plot(df_train['episode'], df_train['normalized_total'], color='C4', alpha=0.3)
+        ax.plot(df_train['episode'], df_train['normalized_total'].rolling(50, min_periods=1).mean(), color='C5', label='rolling(50)')
+        ax.set_title('Normalized Reward (per-episode)')
+        ax.set_xlabel('Episode')
+        ax.set_ylabel('Normalized Total')
+    else:
+        ax.text(0.5, 0.5, 'normalized_total not available in logs', ha='center', va='center')
+    save_fig(fig, '08b_normalized_total.png')
 
 
 def plot_action_vs_state_slice(df_steps):
@@ -386,6 +412,8 @@ def main():
     plot_state_visitation(df_steps)
     plot_trajectories(df_steps)
     plot_reward_components(df_train)
+    plot_avg_fire_distance(df_train)
+    plot_normalized_total(df_train)
     plot_action_vs_state_slice(df_steps)
     plot_q_value_heatmap(df_steps)
     plot_rule_vs_rl_timeline(df_steps)

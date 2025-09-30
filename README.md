@@ -1,0 +1,54 @@
+# Rule Drone Exploration
+
+This project implements a simple rule-based agent and environment for Unmanned Online Area Reconnaissance (UOAR) with drones. The goal is for the drone to explore the maximum area while avoiding fire zones. The agent uses a deterministic rule-based approach (no reinforcement learning).
+
+## Features
+
+- Custom Gymnasium environment (`UOAREnv`) in a single file (`uoar_flat.py`)
+- Rule-based agent (`RuleAgent`) for demonstration
+- Drones receive rewards for exploring new areas and penalties for entering fire zones
+- Visualization using matplotlib
+
+## Installation
+
+```bash
+pip install -r requirements.txt
+```
+
+## Usage
+
+Run the main script directly:
+
+```bash
+# firedrone-rl
+
+UOAR-based drone reinforcement learning environment and training loop.
+
+Install locally (editable install):
+
+```powershell
+pip install -e .
+```
+
+After installation you'll get a console entry point `firedrone-rl`.
+
+Run training or interactive scenarios from the command line:
+
+```powershell
+firedrone-rl
+```
+
+Or import programmatically:
+
+```py
+from uoar_drone_rl import DroneEnv, TD3Agent, main
+main()
+```
+
+Notes:
+- This repository contains a training script `UOAR_drone_rl.py` with an integrated environment `DroneEnv` and a TD3-like agent.
+- For faster experimentation, use the `SMOKE_RUN` environment variable to run a quick non-interactive validation (e.g. `SMOKE_RUN=10`).
+
+If you plan to publish this package, update `pyproject.toml` with authors, license, and a proper project URL.
+
+Contributions welcome — open issues or PRs with improvements.

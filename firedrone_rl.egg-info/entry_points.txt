@@ -1,0 +1,2 @@
+[console_scripts]
+firedrone-rl = uoar_drone_rl.cli:run

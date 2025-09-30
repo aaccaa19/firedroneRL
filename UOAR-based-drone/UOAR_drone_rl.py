@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import csv
 from pathlib import Path
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+import shutil
 
 # --- TUNABLE CONSTANTS (centralized) ---
 # Reward/penalty scaling
@@ -16,26 +17,40 @@ TIMEOUT_PENALTY = -20.0
 # Backwards-compatible alias (some code paths may still reference TERMINAL_PENALTY)
 TERMINAL_PENALTY = COLLISION_PENALTY
 
-# Energy: smaller coefficient and tighter clipping to avoid domination
-ENERGY_COEF = 0.002   # smaller coefficient for per-step energy magnitude
+# Energy: tuned to avoid dominating other reward signals
+# Reduce the raw energy coefficient and make the penalty apply only when
+# energy is above a moving baseline. This prevents the agent from being
+# driven to no-op policies to avoid energy cost.
+ENERGY_COEF = 0.0008   # reduced coefficient for per-step energy magnitude
 # Per-step clip for energy-based penalty (post-baseline subtraction)
-ENERGY_CLIP = 1.0     # tighter clip to avoid huge single-step penalties
+ENERGY_CLIP = 0.5     # tighter clip to avoid huge single-step penalties
 REWARD_CLIP = 50.0
 NORMALIZED_REWARD_CLIP = 5.0
-PROXIMITY_SCALE = 18.0
-OPTIMAL_BONUS = 12.0
+PROXIMITY_SCALE = 22.0
+OPTIMAL_BONUS = 8.0
 # Per-component weights to balance reward components (prox, exploration, energy)
+# Increase exploration weight so finding new fires and scanning matter more
+# Weights for normalized components
 PROX_WEIGHT = 1.5
-EXPL_WEIGHT = 0.6
-# Lower energy weight significantly so it no longer drowns other signals
-ENERGY_WEIGHT = 0.00008
+# Increase exploration weight so finding new fires and scanning matter more
+EXPL_WEIGHT = 1.2
+# Lower energy weight significantly so it no longer drowns other signals.
+# This is applied conservatively in-step (only for positive deviations).
+ENERGY_WEIGHT = 0.000001
+
+# Movement encouragement: small positive bonus when the drone moves
+# purposefully (helps avoid static policies that minimize energy by not moving)
+# Movement encouragement: small positive bonus when the drone moves
+# purposefully (helps avoid static policies that minimize energy by not moving)
+MOVEMENT_BONUS_THRESHOLD = 0.75
+MOVEMENT_BONUS = 1.5
 # Small L2 regularizer on policy actions to discourage saturation (in actor loss)
 ACT_REG = 1e-2
 
 # Replay / normalization warm-up
 REPLAY_WARMUP = 20000  # env steps before training/normalizing rewards
 # Increase warmup transitions so normalization and critic updates are stable
-N_WARMUP_TRANSITIONS = 10000  # transitions to collect before using normalization
+N_WARMUP_TRANSITIONS = 2000  # transitions to collect before using normalization (reduced to start normalizing sooner)
 
 # Optional small actor-side energy regularizer (penalize large action magnitudes)
 ENERGY_ACT_REG = 2e-3
@@ -314,8 +329,9 @@ class DroneEnv(gym.Env):
                 # --- Proximity reward logic for keeping average fire distance near 1 ---
                 optimal_dist = 1.0
                 distance_error = abs(min_dist - optimal_dist)
-                # Small bounded proximal encouragement scaled by PROXIMITY_SCALE
-                prox = PROXIMITY_SCALE * max(0, 1 - distance_error)
+                # Gaussian-shaped proximal encouragement centered at optimal_dist=1.0
+                sigma = 0.4
+                prox = PROXIMITY_SCALE * np.exp(-0.5 * (distance_error / sigma) ** 2)
                 rewards[i] += PROX_WEIGHT * prox
                 proximity_contrib[i] += PROX_WEIGHT * prox
                 if min_dist > optimal_dist + 1.0:
@@ -344,9 +360,27 @@ class DroneEnv(gym.Env):
                 exp_reward = proximity_scale * np.exp(-alpha * safe_distance)
                 rewards[i] += PROX_WEIGHT * exp_reward
                 proximity_contrib[i] += PROX_WEIGHT * exp_reward
+                # Small lateral/patrol bonus: encourage movement parallel to fire line
+                try:
+                    # compute local tangent along fire line (2D) and drone horizontal velocity (approx)
+                    fire_dir = np.array(self.fire_line[1][:2]) - np.array(self.fire_line[0][:2])
+                    fire_dir = fire_dir / (np.linalg.norm(fire_dir) + 1e-8)
+                    # approximate drone horizontal velocity from prev_positions if available
+                    if hasattr(self, 'prev_positions') and self.prev_positions[i] is not None:
+                        horiz_vel = (self.drone_pos[i][:2] - self.prev_positions[i][:2])
+                        horiz_speed = np.linalg.norm(horiz_vel)
+                        if horiz_speed > 1e-6:
+                            vel_dir = horiz_vel / horiz_speed
+                            alignment = float(np.dot(vel_dir, fire_dir))
+                            lateral_bonus = 0.5 * max(0.0, abs(alignment)) * horiz_speed
+                            rewards[i] += PROX_WEIGHT * lateral_bonus
+                            proximity_contrib[i] += PROX_WEIGHT * lateral_bonus
+                except Exception:
+                    pass
                 # Additional bonus for being in optimal range (just outside safety margin)
+                # Only apply the optimal bonus when the actual distance to fire is <= 1.0
                 optimal_range = 0.3  # Distance beyond safety margin that's considered optimal
-                if safe_distance <= optimal_range:
+                if safe_distance <= optimal_range and min_dist <= 1.0:
                     optimal_bonus = OPTIMAL_BONUS * (1 - safe_distance / optimal_range)
                     rewards[i] += PROX_WEIGHT * optimal_bonus
                     proximity_contrib[i] += PROX_WEIGHT * optimal_bonus
@@ -402,7 +436,8 @@ class DroneEnv(gym.Env):
                         if not occluded:
                             seen_mask[gx, gy] = True
         # Give reduced reward for seen cells, reset their reward to 0
-        exploration_scale = 0.05  # Reduced impact of exploration (smaller to avoid large totals)
+        # Increase exploration impact so that scanning/discovery is more attractive
+        exploration_scale = 0.20  # increased further to encourage scanning
         # Iterate cells and distribute clamped per-cell reward to drones equally
         for gx in range(grid_dim):
             for gy in range(grid_dim):
@@ -444,12 +479,15 @@ class DroneEnv(gym.Env):
 
         for i in range(self.n_drones):
             pos = self.drone_pos[i]
-            # Penalty for staying in the same place for too long
+            # Penalty for staying in the same place for too long; small movement bonus otherwise
             if self.prev_positions[i] is not None:
                 movement = np.linalg.norm(pos - self.prev_positions[i])
-                # Reduced movement penalty to avoid large accumulated negatives
-                if movement < 0.15:  # threshold for 'staying still'
-                    rewards[i] -= 1.0
+                # If drone moves a meaningful amount, give a small positive bonus to encourage exploration
+                if movement >= MOVEMENT_BONUS_THRESHOLD:
+                    rewards[i] += MOVEMENT_BONUS
+                else:
+                    # Mild penalty for remaining almost stationary (reduced magnitude)
+                    rewards[i] -= 0.5
 
             self.prev_positions[i] = pos.copy()
             # Exploration bonus for discovering new fires
@@ -457,7 +495,8 @@ class DroneEnv(gym.Env):
                 dist_to_fire = np.linalg.norm(pos - fc)
                 if dist_to_fire < (self.fire_radius + self.safety_margin + 1.0):
                     if idx not in self.fires_visited[i]:
-                        bonus = 20.0
+                        # Increase discovery bonus to encourage finding and investigating fires
+                        bonus = 160.0
                         rewards[i] += EXPL_WEIGHT * bonus
                         exploration_contrib[i] += EXPL_WEIGHT * bonus
                         self.fires_visited[i].add(idx)
@@ -489,11 +528,12 @@ class DroneEnv(gym.Env):
                 energy_raw = energy_coeff * float(np.mean(np.abs(da)))
                 # update EMA baseline
                 self.energy_ema = (1 - self.energy_ema_alpha) * self.energy_ema + self.energy_ema_alpha * energy_raw
+                # relative energy above baseline only
                 energy_rel = energy_raw - self.energy_ema
-                # Clip to avoid huge single-step penalties
-                energy_rel = float(np.clip(energy_rel, -ENERGY_CLIP, ENERGY_CLIP))
-                # Subtract weighted penalty
-                energy_penalty = ENERGY_WEIGHT * energy_rel
+                # Only penalize when relative energy is positive (i.e., above baseline)
+                energy_rel_pos = float(np.clip(energy_rel, 0.0, ENERGY_CLIP))
+                # Subtract weighted penalty (apply conservatively)
+                energy_penalty = ENERGY_WEIGHT * energy_rel_pos
                 rewards[i] -= energy_penalty
                 # record for logging (store raw and relative versions)
                 energy_components[i] = float(energy_raw)
@@ -801,7 +841,7 @@ class TD3Agent:
     def decay_noise(self, decay_rate=0.99, min_noise=0.01):
         """Decay the noise levels by decay_rate, not going below min_noise."""
         self.noise_levels = [max(n * decay_rate, min_noise) for n in self.noise_levels]
-    def __init__(self, area_size, drone_radius, fire_line, fire_radius, safety_margin, max_step_size, obs_dim=7, act_dim=3, n_critics=2, n_candidates=30, noise_levels=None, gamma=0.95, tau=0.005, policy_noise=0.12, noise_clip=0.25, policy_delay=2, buffer_size=200000, batch_size=2048, hidden_size=384):
+    def __init__(self, area_size, drone_radius, fire_line, fire_radius, safety_margin, max_step_size, obs_dim=7, act_dim=3, n_critics=2, n_candidates=30, noise_levels=None, gamma=0.95, tau=0.005, policy_noise=0.12, noise_clip=0.25, policy_delay=2, buffer_size=200000, batch_size=256, hidden_size=384):
         if noise_levels is None:
             # stronger initial candidate noise for exploration
             noise_levels = [0.1, 0.2, 0.3, 0.5]
@@ -889,6 +929,8 @@ class TD3Agent:
         # Generate actions that move towards optimal distance from fire
         min_safe_dist = self.drone_radius + self.fire_radius + self.safety_margin
         optimal_dist = min_safe_dist + 0.15  # Slightly outside safety margin
+        # Enforce user constraint: optimal distance cannot go above 1.0
+        optimal_dist = min(optimal_dist, 1.0)
         
         if dist_to_fire > optimal_dist + 0.5:
             # Too far - move towards fire
@@ -954,10 +996,11 @@ class TD3Agent:
                 proximity_scale = PROXIMITY_SCALE
                 immediate_reward = proximity_scale * np.exp(-alpha * safe_distance)
 
-                # Add small optimal range bonus
+                # Add small optimal range bonus (clamped optimal distance near 1.0)
                 optimal_range = 0.3
                 if safe_distance <= optimal_range:
-                    optimal_bonus = 20 * (1 - safe_distance / optimal_range)
+                    # Use shared OPTIMAL_BONUS constant for consistency
+                    optimal_bonus = OPTIMAL_BONUS * (1 - safe_distance / optimal_range)
                     immediate_reward += optimal_bonus
             
             # Long-term Q (average over critics)
@@ -966,10 +1009,10 @@ class TD3Agent:
             q_vals = [critic(obs_t, act_t).item() for critic in self.critics]
             avg_q = np.mean(q_vals)
             
-            # Estimate candidate energy (squared delta of action magnitude relative to zero)
+            # Estimate candidate energy (squared magnitude)
             est_energy = float(np.sum(a ** 2) / max(1, a.size))
-            # Weighted score: immediate reward + discounted Q - small energy penalty
-            energy_penalty_est = ENERGY_WEIGHT * est_energy * 1.0  # stronger estimated penalty
+            # Apply a much smaller penalty during candidate scoring so exploration isn't squashed
+            energy_penalty_est = (ENERGY_WEIGHT * 0.25) * est_energy
             score = immediate_reward + self.gamma * avg_q - energy_penalty_est
             scores.append(score)
         
@@ -1192,7 +1235,7 @@ def main():
     # Open and write headers
     training_fp = open(training_csv_path, 'w', newline='')
     training_writer = csv.writer(training_fp)
-    training_writer.writerow(["episode", "total_reward", "length", "success", "collisions", "avg_goal_dist", "crash_types", "proximity_component", "exploration_component", "energy_component", "normalized_total", "norm_prox_mean", "norm_expl_mean", "norm_energy_mean", "action_saturation_fraction", "actor_loss", "critic_loss", "td_error"])
+    training_writer.writerow(["episode", "total_reward", "length", "success", "collisions", "avg_goal_dist", "crash_types", "proximity_component", "exploration_component", "energy_component", "fires_discovered", "normalized_total", "norm_prox_mean", "norm_expl_mean", "norm_energy_mean", "action_saturation_fraction", "actor_loss", "critic_loss", "td_error"])
 
     steps_fp = open(steps_csv_path, 'w', newline='')
     steps_writer = csv.writer(steps_fp)
@@ -1242,6 +1285,12 @@ def main():
             print(f"  Safety margin for this level: {env.safety_margin:.2f}")
             for episode in range(curriculum_episodes):
                 obs, _ = env.reset()
+                # Ensure per-episode discovery tracking is reset
+                try:
+                    env.fires_visited = [set() for _ in range(env.n_drones)]
+                except Exception:
+                    # Fallback: attach attribute if missing
+                    env.fires_visited = [set() for _ in range(env.n_drones)]
                 done = [False, False]
                 total_reward = [0, 0]
                 fire_distances = [[], []]  # Track fire distances during episode
@@ -1396,7 +1445,12 @@ def main():
                         except Exception:
                             episode_normalized_components = [[] for _ in range(env.n_drones)]
                         try:
-                            episode_normalized_components[i].append((exploration_norm, proximity_norm, energy_norm, normalized_total))
+                            # Clip per-step normalized_total to avoid extreme artifacts
+                            try:
+                                clipped_norm_total = float(np.clip(normalized_total, -float(NORMALIZED_REWARD_CLIP), float(NORMALIZED_REWARD_CLIP))) if normalized_total is not None else float('nan')
+                            except Exception:
+                                clipped_norm_total = float('nan')
+                            episode_normalized_components[i].append((exploration_norm, proximity_norm, energy_norm, clipped_norm_total))
                         except Exception:
                             episode_normalized_components[i].append((float('nan'), float('nan'), float('nan'), float('nan')))
                         # If env provided component breakdown in info, record for logging
@@ -1596,7 +1650,12 @@ def main():
                 except Exception:
                     norm_prox_mean = norm_expl_mean = norm_energy_mean = float('nan')
 
-                training_writer.writerow([global_episode_counter, float(np.mean(total_reward)), int(steps), success, int(collisions), float(avg_goal_dist), ";".join([str(ct) for ct in crash_type]), prox_comp, expl_comp, energy_comp, norm_total, norm_prox_mean, norm_expl_mean, norm_energy_mean, action_saturation_fraction, actor_loss_log, critic_loss_log, td_error_log])
+                # Count fires discovered this episode (drone 0 used as representative; sum unique discoveries across drones)
+                try:
+                    fires_discovered = sum(len(s) for s in getattr(env, 'fires_visited', [set() for _ in range(env.n_drones)]))
+                except Exception:
+                    fires_discovered = 0
+                training_writer.writerow([global_episode_counter, float(np.mean(total_reward)), int(steps), success, int(collisions), float(avg_goal_dist), ";".join([str(ct) for ct in crash_type]), prox_comp, expl_comp, energy_comp, int(fires_discovered), norm_total, norm_prox_mean, norm_expl_mean, norm_energy_mean, action_saturation_fraction, actor_loss_log, critic_loss_log, td_error_log])
 
                 # Write per-step rows (log only drone 0 for compactness)
                 # When writing per-step rows, attempt to split reward into components if possible.
@@ -1854,23 +1913,46 @@ def main():
         np.save(fname, {'xs': xs, 'ys': ys, 'grid': grid})
         print(f"Wrote decision map to {fname}")
 
-    save_input = input(f"Save trained agents to file? (y/n): ").strip().lower()
-    if save_input == 'y':
-        for i, agent in enumerate(agents):
-            fname = f"td3_agent_{i}.pkl"
-            if os.path.exists(fname):
-                overwrite = input(f"File '{fname}' exists. Overwrite? (y/n): ").strip().lower()
-                if overwrite != 'y':
-                    print(f"Skipping save for agent {i}.")
-                    continue
-            agent.save(fname)
-            print(f"Saved agent {i} to '{fname}'.")
-            # Export decision map for agent 0 only (helpful for plotting)
-            if i == 0:
+    # Non-interactive auto-save when running in SMOKE_RUN mode
+    smoke_env = os.environ.get('SMOKE_RUN', '0')
+    try:
+        smoke_episodes = int(smoke_env)
+    except Exception:
+        smoke_episodes = 0
+    if smoke_episodes > 0:
+        # Auto-save agent 0 to a deterministic filename for later inspection
+        try:
+            # If an existing file is present, back it up first
+            dst = 'td3_agent_0.pkl'
+            if os.path.exists(dst):
+                bak = dst + '.bak'
                 try:
-                    export_decision_map(agent, env)
-                except Exception as e:
-                    print("Failed to export decision map:", e)
+                    shutil.copyfile(dst, bak)
+                    print(f"Backed up existing '{dst}' to '{bak}'")
+                except Exception:
+                    pass
+            agents[0].save(dst)
+            print(f"Auto-saved agent 0 to '{dst}' (SMOKE_RUN mode)")
+        except Exception as e:
+            print("Failed to auto-save agent in SMOKE_RUN mode:", e)
+    else:
+        save_input = input(f"Save trained agents to file? (y/n): ").strip().lower()
+        if save_input == 'y':
+            for i, agent in enumerate(agents):
+                fname = f"td3_agent_{i}.pkl"
+                if os.path.exists(fname):
+                    overwrite = input(f"File '{fname}' exists. Overwrite? (y/n): ").strip().lower()
+                    if overwrite != 'y':
+                        print(f"Skipping save for agent {i}.")
+                        continue
+                agent.save(fname)
+                print(f"Saved agent {i} to '{fname}'.")
+                # Export decision map for agent 0 only (helpful for plotting)
+                if i == 0:
+                    try:
+                        export_decision_map(agent, env)
+                    except Exception as e:
+                        print("Failed to export decision map:", e)
 
     # Close log files if open
     try:
@@ -1891,8 +1973,14 @@ def main():
 
 if __name__ == "__main__":
     import os
-    if os.environ.get('SMOKE_RUN', '0') == '1':
-        # Minimal non-interactive smoke run for quick validation
+    # Support SMOKE_RUN as an integer number of episodes (e.g. SMOKE_RUN=100)
+    smoke_env = os.environ.get('SMOKE_RUN', '0')
+    try:
+        smoke_episodes = int(smoke_env)
+    except Exception:
+        smoke_episodes = 0
+    if smoke_episodes > 0:
+        # Minimal non-interactive smoke run for quick validation; uses smoke_episodes
         def smoke_run(episodes=10):
             env = DroneEnv(scenario=1)
             obs, _ = env.reset()
@@ -1913,6 +2001,6 @@ if __name__ == "__main__":
                     obs = next_obs
                     steps += 1
             print('SMOKE_RUN_COMPLETE')
-        smoke_run(episodes=10)
+        smoke_run(episodes=smoke_episodes)
     else:
         main()
