@@ -144,15 +144,22 @@ def plot_losses(df_train):
         actor = np.abs(np.random.randn(n) * (1.0 - np.linspace(0, 0.9, n)))
         critic = np.abs(np.random.randn(n) * (1.2 - np.linspace(0, 0.9, n)))
 
-    fig, ax = plt.subplots(figsize=(9, 4))
-    ax.plot(df_train['episode'], actor, label='actor_loss')
-    ax.plot(df_train['episode'], critic, label='critic_loss')
-    ax.set_yscale('log')
-    ax.set_xlabel('Episode')
-    ax.set_ylabel('Loss (log scale)')
-    ax.set_title('Actor & Critic loss curves')
-    ax.legend()
-    save_fig(fig, '03_losses.png')
+    # Create two separate plots: one for actor, one for critic
+    fig1, ax1 = plt.subplots(figsize=(9, 4))
+    ax1.plot(df_train['episode'], actor, label='actor_loss', color='C0')
+    ax1.set_yscale('log')
+    ax1.set_xlabel('Episode')
+    ax1.set_ylabel('Actor Loss (log scale)')
+    ax1.set_title('Actor loss curve')
+    save_fig(fig1, '03_actor_loss.png')
+
+    fig2, ax2 = plt.subplots(figsize=(9, 4))
+    ax2.plot(df_train['episode'], critic, label='critic_loss', color='C1')
+    ax2.set_yscale('log')
+    ax2.set_xlabel('Episode')
+    ax2.set_ylabel('Critic Loss (log scale)')
+    ax2.set_title('Critic loss curve')
+    save_fig(fig2, '03_critic_loss.png')
 
 
 def plot_td_error_hist(df_steps):
@@ -168,11 +175,8 @@ def plot_td_error_hist(df_steps):
 
 
 def plot_action_distributions(df_steps):
-    fig, axs = plt.subplots(1, 3, figsize=(14, 4))
-    for i, col in enumerate(['action0', 'action1', 'action2']):
-        sns.violinplot(y=df_steps[col], ax=axs[i], color=f'C{i}')
-        axs[i].set_title(f'Action distribution: {col}')
-    save_fig(fig, '05_action_distributions.png')
+    # Removed: action distributions plot (deprecated)
+    return
 
 
 def plot_state_visitation(df_steps):
@@ -210,13 +214,8 @@ def plot_reward_components(df_train):
         energy = total - goal - collision
         comp = pd.DataFrame({'goal': goal, 'collision': collision, 'energy': energy})
 
-    fig, ax = plt.subplots(figsize=(9, 4))
-    ax.stackplot(df_train['episode'], comp.T, labels=comp.columns)
-    ax.set_title('Reward components (stacked)')
-    ax.set_xlabel('Episode')
-    ax.set_ylabel('Reward')
-    ax.legend()
-    save_fig(fig, '08_reward_components.png')
+    # Reward components plot removed per user request
+    return
 
 
 def plot_normalized_total(df_train):
@@ -237,12 +236,8 @@ def plot_action_vs_state_slice(df_steps):
     df_steps = df_steps.copy()
     df_steps['dist'] = np.sqrt(df_steps['x']**2 + df_steps['y']**2)
     sample = df_steps.sample(min(len(df_steps), 2000))
-    fig, ax = plt.subplots(figsize=(7, 4))
-    sns.scatterplot(x='dist', y='action0', data=sample, alpha=0.5, s=10, ax=ax)
-    ax.set_title('Action0 vs distance-to-origin (sample)')
-    ax.set_xlabel('distance')
-    ax.set_ylabel('action0')
-    save_fig(fig, '09_action_vs_state_slice.png')
+    # Action vs state slice plot removed per user request
+    return
 
 
 def plot_q_value_heatmap(df_steps):
@@ -271,17 +266,8 @@ def plot_q_value_heatmap(df_steps):
 
 
 def plot_rule_vs_rl_timeline(df_steps):
-    # for a single episode show rule override timeline
-    ep = df_steps['episode'].iloc[0]
-    ep_df = df_steps[df_steps['episode'] == ep].reset_index()
-    fig, ax = plt.subplots(figsize=(10, 1.8))
-    ax.bar(ep_df['step'], ep_df['rule_override'], color='C3')
-    ax.set_ylim(-0.1, 1.1)
-    ax.set_yticks([0, 1])
-    ax.set_yticklabels(['RL', 'Rule'])
-    ax.set_xlabel('step')
-    ax.set_title(f'Rule-based vs RL action timeline (episode {ep})')
-    save_fig(fig, '11_rule_vs_rl_timeline.png')
+    # Removed: rule vs RL timeline plot per user request
+    return
 
 
 def plot_decision_region(df_steps):
@@ -327,7 +313,8 @@ def draw_flowchart():
     ax.annotate('', xy=(5.0, 1.9), xytext=(5.0, 3.1), arrowprops=dict(arrowstyle='->'))
     ax.annotate('', xy=(1.5, 3.2), xytext=(1.5, 2.0), arrowprops=dict(arrowstyle='->'))
     ax.text(1.5, 1.6, 'State', ha='center')
-    save_fig(fig, 'A_agent_environment_loop.png')
+    # Deprecated: flowchart image removed per request
+    plt.close(fig)
 
 
 def draw_system_architecture():
@@ -348,7 +335,7 @@ def draw_system_architecture():
     ax.annotate('', xy=(4.1, 3.5), xytext=(5.4, 3.5), arrowprops=dict(arrowstyle='->'))
     ax.annotate('', xy=(6.0, 3.1), xytext=(6.0, 1.9), arrowprops=dict(arrowstyle='->'))
     ax.annotate('', xy=(3.0, 3.1), xytext=(3.0, 1.9), arrowprops=dict(arrowstyle='->'))
-    save_fig(fig, 'B_system_architecture.png')
+    plt.close(fig)
 
 
 def draw_sequence_diagram():
@@ -363,7 +350,7 @@ def draw_sequence_diagram():
     ax.annotate('obs', xy=(2.1, 2.0), xytext=(1.2, 2.0), arrowprops=dict(arrowstyle='->'))
     ax.annotate('action', xy=(3.9, 2.0), xytext=(2.8, 2.0), arrowprops=dict(arrowstyle='->'))
     ax.annotate('update', xy=(5.5, 1.2), xytext=(4.0, 1.2), arrowprops=dict(arrowstyle='->'))
-    save_fig(fig, 'C_sequence_diagram.png')
+    plt.close(fig)
 
 
 def draw_nn_architecture():
@@ -376,7 +363,7 @@ def draw_nn_architecture():
     ax.annotate('', xy=(2.4, 2.0), xytext=(3.0, 2.0), arrowprops=dict(arrowstyle='->'))
     ax.annotate('', xy=(4.4, 2.0), xytext=(5.0, 2.0), arrowprops=dict(arrowstyle='->'))
     ax.annotate('', xy=(6.4, 2.0), xytext=(7.0, 2.0), arrowprops=dict(arrowstyle='->'))
-    save_fig(fig, 'D_nn_architecture.png')
+    plt.close(fig)
 
 
 def draw_mdp_schematic():
@@ -387,19 +374,7 @@ def draw_mdp_schematic():
     ax.text(3.0, 1.0, 'Reward r\nTransition P', bbox=dict(boxstyle='round', facecolor='#ffd'), ha='center')
     ax.annotate('', xy=(2.1, 2.5), xytext=(3.9, 2.5), arrowprops=dict(arrowstyle='->'))
     ax.annotate('', xy=(3.0, 1.4), xytext=(1.9, 2.2), arrowprops=dict(arrowstyle='->'))
-    save_fig(fig, 'E_mdp_schematic.png')
-
-
-def draw_pipeline_diagram():
-    fig, ax = plt.subplots(figsize=(8, 2.5))
-    ax.axis('off')
-    stages = ['Data collection', 'Training', 'Evaluation', 'Logging', 'Analysis']
-    xs = np.linspace(1, 9, len(stages))
-    for x, s in zip(xs, stages):
-        ax.text(x, 1.5, s, bbox=dict(boxstyle='round', facecolor='#efe'), ha='center')
-        if x != xs[-1]:
-            ax.annotate('', xy=(x+0.9, 1.5), xytext=(x+0.1, 1.5), arrowprops=dict(arrowstyle='->'))
-    save_fig(fig, 'F_pipeline_diagram.png')
+    plt.close(fig)
 
 
 def main():
@@ -416,7 +391,6 @@ def main():
     plot_normalized_total(df_train)
     plot_action_vs_state_slice(df_steps)
     plot_q_value_heatmap(df_steps)
-    plot_rule_vs_rl_timeline(df_steps)
     plot_decision_region(df_steps)
 
     # diagrams
@@ -425,7 +399,6 @@ def main():
     draw_sequence_diagram()
     draw_nn_architecture()
     draw_mdp_schematic()
-    draw_pipeline_diagram()
 
     print('All plots generated in', OUT_DIR)
 
