@@ -1,6 +1,0 @@
-episode,total_reward,length,success,collisions,avg_goal_dist,crash_types,proximity_component,exploration_component,energy_component,normalized_total,norm_prox_mean,norm_expl_mean,norm_energy_mean,action_saturation_fraction,actor_loss,critic_loss,td_error
-1,-3836.8855518885453,300,0,2,3.2440106301314717,None;fire collision,nan,nan,nan,0.0,nan,nan,nan,0.015555555555555553,nan,nan,nan
-2,-3204.2994762230433,300,0,2,4.34700873205016,None;None,nan,nan,nan,0.0,nan,nan,nan,0.025555555555555554,nan,nan,nan
-3,-6060.616635771778,300,0,2,2.2451342759809796,fire collision;None,nan,nan,nan,0.0,nan,nan,nan,0.013333333333333334,nan,nan,nan
-4,-6583.205142331339,279,0,2,1.0209840673092114,fire collision;fire collision,nan,nan,nan,0.0,nan,nan,nan,0.015531660692951015,nan,nan,nan
-5,-2084.392136041909,300,0,2,3.2382420533308602,None;None,nan,nan,nan,0.0,nan,nan,nan,0.02,nan,nan,nan
