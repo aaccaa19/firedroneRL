@@ -33,4 +33,3 @@ Files generated
 - 07_trajectories.png
 - 10_q_value_heatmap.png
 - 12_decision_region.png
-- F_pipeline_diagram.png

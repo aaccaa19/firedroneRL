@@ -10,6 +10,12 @@ Requires-Dist: gymnasium
 Requires-Dist: numpy
 Requires-Dist: torch
 Requires-Dist: matplotlib
+Requires-Dist: pathlib 
+Requires-Dist: numpy 
+Requires-Dist: pandas 
+Requires-Dist: seaborn 
+Requires-Dist: os
+
 
 # Rule Drone Exploration
 

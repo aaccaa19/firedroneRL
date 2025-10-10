@@ -1189,23 +1189,42 @@ class TD3Agent:
 # --- MAIN LOOP ---
 def main():
     import os
-    scenario_names = {1: "Static Fire Line", 3: "Line of Fires", 2: "Spreading Fire", 4: "Random Fires", 5: "Impassable Fire Wall (w/ Random Crash)", 6: "Central Fire"}
-    all_scenarios = [1, 3, 2, 4, 5, 6]
-    print("Available scenarios:")
+    scenario_names = {1: "Static Fire Line", 2: "Spreading Fire", 3: "Line of Fires", 4: "Random Fires", 5: "Impassable Fire Wall (w/ Random Crash)", 6: "Central Fire"}
+    all_scenarios = sorted(list(scenario_names.keys()))
+
+    # Ask whether to include the final test (section 2) for the chosen scenario
+    use_final_test_input = input("Include final test (section 2) after training for the chosen scenario? (y/n): ").strip().lower()
+    use_final_test = use_final_test_input == 'y'
+
+    print("Available scenarios (choose one):")
     for s in all_scenarios:
         print(f"  {s}: {scenario_names[s]}")
-    user_input = input("Enter scenario numbers to run, separated by commas (e.g., 1,3,4,1): ").strip()
-    if user_input:
-        try:
-            scenarios = [int(x) for x in user_input.split(',') if int(x) in all_scenarios]
-            if not scenarios:
-                print("No valid scenarios selected. Running all by default.")
-                scenarios = all_scenarios
-        except Exception:
-            print("Invalid input. Running all scenarios by default.")
-            scenarios = all_scenarios
-    else:
-        scenarios = all_scenarios
+    user_input = input("Enter a single scenario number to run (e.g., 1): ").strip()
+    try:
+        scenario_choice = int(user_input)
+        if scenario_choice in all_scenarios:
+            scenarios = [scenario_choice]
+        else:
+            print("Invalid scenario selected. Defaulting to scenario 1.")
+            scenarios = [all_scenarios[0]]
+    except Exception:
+        print("No valid input. Defaulting to scenario 1.")
+        scenarios = [all_scenarios[0]]
+
+    # Ask user for configurable run parameters
+    try:
+        curriculum_episodes = int(input("Enter number of episodes per curriculum level (e.g. 1): ").strip())
+        if curriculum_episodes < 1:
+            curriculum_episodes = 1
+    except Exception:
+        curriculum_episodes = 1
+
+    try:
+        steps_per_episode = int(input("Enter maximum steps per episode (e.g. 300): ").strip())
+        if steps_per_episode < 1:
+            steps_per_episode = 300
+    except Exception:
+        steps_per_episode = 300
     # Ask user if they want to see visualization at the end of each scenario
     vis_input = input("Show visualization at the end of each scenario? (y/n): ").strip().lower()
     show_vis_each = vis_input == 'y'
@@ -1313,7 +1332,11 @@ def main():
                     except Exception:
                         print(f"Failed to load legacy agent file '{legacy}'. Training will start from scratch for scenario {scenario}.")
         # Each scenario is divided into two sections as requested. Sections 1 and 2
-        for section in [1, 2]:
+        # Section 1..5 are curriculum levels; section 2 is used as final test when requested
+        sections = [1]
+        if use_final_test:
+            sections = [1, 2]
+        for section in sections:
             for curriculum_level in range(5):  # 5 curriculum levels per scenario
                 print(f"  --- SECTION {section} - CURRICULUM LEVEL {curriculum_level + 1}/5 ---")
                 env = DroneEnv(curriculum_level=curriculum_level, scenario=scenario)
@@ -1440,7 +1463,7 @@ def main():
                 episode_actions = []
                 rewards = [0, 0]  # Initialize rewards before first step
 
-                while not all(done) and steps < 300:
+                while not all(done) and steps < steps_per_episode:
                     actions = np.zeros((env.n_drones, 3))
                     for i in range(env.n_drones):
                         if not done[i]:
@@ -1877,10 +1900,18 @@ def main():
 
                     steps_writer.writerow([global_episode_counter, t, float(st[0]), float(st[1]), float(st[2]), float(act[0]), float(act[1]), float(act[2]), reward_step_clamped, exploration_comp, proximity_comp, energy_val, expl_norm, prox_norm, energy_norm, norm_reward_step, td_error_val, action_saturation, 0])
 
-                print(f"Episode {scenario_episode}/{5 * curriculum_episodes} (Scenario {scenario}, Level {curriculum_level+1}) Total Rewards: {[round(r, 1) for r in total_reward]}")
+                # Human-friendly episode summary
+                end_msgs = []
                 for i in range(env.n_drones):
+                    if crash_type[i] is None:
+                        end_reason = 'completed'
+                    else:
+                        end_reason = crash_type[i]
                     avg_dist = avg_fire_distances[i][-1] if avg_fire_distances[i] else float('inf')
-                    print(f"  Drone {i+1}: Total Points = {total_reward[i]:.1f}, Avg Fire Distance = {avg_dist:.2f}, Ended by: {crash_type[i]}")
+                    end_msgs.append(f"Drone {i+1}: Total Points = {total_reward[i]:.1f}, Avg Fire Distance = {avg_dist:.2f}, Ended by: {end_reason}")
+                print(f"Episode {scenario_episode}/{5 * curriculum_episodes} (Scenario {scenario}, Level {curriculum_level+1}) Total Rewards: {[round(r, 1) for r in total_reward]}")
+                for m in end_msgs:
+                    print('  ' + m)
 
                 # Decay noise for all agents after each episode
                 for agent in agents:

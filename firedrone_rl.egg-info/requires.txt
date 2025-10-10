@@ -4,3 +4,6 @@ torch
 matplotlib
 pandas
 seaborn
+os
+numpy
+pathlib
