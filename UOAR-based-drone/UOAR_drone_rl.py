@@ -121,10 +121,10 @@ class DroneEnv(gym.Env):
             self.fire_centers = [center]
             self.fire_radius = 2.5  # Large fire size for scenario 6
         self.action_space = spaces.Box(low=-1, high=1, shape=(self.n_drones,3), dtype=np.float32)
-        # Each drone: [x, y, z, fire_below, other_x, other_y, other_z]
-        low = np.array([0,0,0,0,0,0,0]*self.n_drones).reshape((self.n_drones,7))
-        high = np.array([area_size,area_size,area_size,1,area_size,area_size,area_size]*self.n_drones).reshape((self.n_drones,7))
-        self.observation_space = spaces.Box(low=low, high=high, shape=(self.n_drones,7), dtype=np.float32)
+    # Each drone: [x, y, z, fire_below, other_x, other_y, other_z, fire_x, fire_y, fire_z]
+        low = np.array([0,0,0,0,0,0,0,0,0,0]*self.n_drones).reshape((self.n_drones,10))
+        high = np.array([area_size,area_size,area_size,1,area_size,area_size,area_size,area_size,area_size,area_size]*self.n_drones).reshape((self.n_drones,10))
+        self.observation_space = spaces.Box(low=low, high=high, shape=(self.n_drones,10), dtype=np.float32)
         # --- Add cell_rewards for regenerating reward ---
         grid_size = 0.5
         grid_dim = int(self.area_size // grid_size)
@@ -189,7 +189,6 @@ class DroneEnv(gym.Env):
     def _get_obs(self):
         # Each drone sees a cone on the ground; the higher it is, the larger the cone
         def point_to_segment_dist_2d(p, a, b):
-            # 2D distance from point p to segment ab
             ap = p - a
             ab = b - a
             t = np.dot(ap, ab) / (np.dot(ab, ab) + 1e-8)
@@ -197,29 +196,29 @@ class DroneEnv(gym.Env):
             closest = a + t * ab
             return np.linalg.norm(p - closest)
         def is_blocked_by_fire(drone_xy, fire_centers_2d, fire_radius, target_xy):
-            # Returns True if a fire is between drone_xy and target_xy
             for fc in fire_centers_2d:
-                # Ensure fc is 2D for all calculations
                 fc2d = fc[:2] if fc.shape[0] > 2 else fc
-                # Vector from drone to fire and drone to target
                 v_fire = fc2d - drone_xy
                 v_target = (target_xy[:2] if target_xy.shape[0] > 2 else target_xy) - drone_xy
                 dist_to_fire = np.linalg.norm(v_fire)
                 dist_to_target = np.linalg.norm(v_target)
                 if dist_to_fire < dist_to_target and dist_to_fire > 1e-6:
-                    # Angle between vectors
                     cos_angle = np.dot(v_fire, v_target) / (dist_to_fire * dist_to_target + 1e-8)
-                    if cos_angle > 0.99:  # ~8 deg cone, adjust as needed
-                        # Check if fire center is close to the line from drone to target
+                    if cos_angle > 0.99:
                         proj = np.dot(v_fire, v_target) / (np.linalg.norm(v_target) + 1e-8)
                         closest = drone_xy + v_target / np.linalg.norm(v_target) * proj
                         if np.linalg.norm(fc2d - closest) <= fire_radius:
                             return True
             return False
+
         obs = []
-        k = 0.5  # scaling factor for cone radius (reduced by half)
+        k = 0.5
         fire_a_2d = np.array([self.fire_line[0][0], self.fire_line[0][1]])
         fire_b_2d = np.array([self.fire_line[1][0], self.fire_line[1][1]])
+
+        # Track fires seen by any drone this step
+        fires_seen = set()
+        fire_locations = []
         for i in range(self.n_drones):
             pos = self.drone_pos[i]
             other = self.drone_pos[1-i]
@@ -227,28 +226,34 @@ class DroneEnv(gym.Env):
             z = pos[2]
             view_radius = k * z / 8
             fire_in_view = 0.0
-            # For all scenarios, check occlusion by fire (cannot see behind fire)
+            fire_seen_location = np.array([0.0, 0.0, 0.0])
             fire_centers_2d = np.array([[fc[0], fc[1]] for fc in self.fire_centers]) if self.fire_centers else np.empty((0,2))
-            # For scenario 1 and 5, treat the fire line or wall as a set of closely spaced fire centers for occlusion
             if (self.scenario == 1 or self.scenario == 5) and fire_centers_2d.shape[0] == 0:
-                # Discretize the fire line/wall into points for occlusion
                 n_points = 20
                 if self.scenario == 1:
                     a, b = self.fire_line[0], self.fire_line[1]
                 else:
-                    # Wall at x=fire_wall_x, spanning y and z
                     a = np.array([self.fire_wall_x, 0])
                     b = np.array([self.fire_wall_x, self.area_size])
                 fire_centers_2d = np.array([a + (b - a) * t for t in np.linspace(0, 1, n_points)])
-            # Check if any fire is visible (not blocked by another fire)
-            for fc in fire_centers_2d:
+            for idx, fc in enumerate(self.fire_centers):
                 dist = np.linalg.norm(drone_xy - fc[:2])
                 if dist <= (view_radius + self.fire_radius):
                     blocked = is_blocked_by_fire(drone_xy, fire_centers_2d, self.fire_radius, fc)
                     if not blocked:
                         fire_in_view = 1.0
+                        fire_seen_location = fc.copy()
+                        fires_seen.add(idx)
                         break
-            obs.append(np.concatenate([pos, [fire_in_view], other]))
+            fire_locations.append(fire_seen_location)
+            obs.append(np.concatenate([pos, [fire_in_view], other, fire_seen_location]))
+
+        # If any drone saw a fire, share the location with all drones
+        if fires_seen:
+            # Use the first seen fire location for all drones
+            shared_fire_location = self.fire_centers[list(fires_seen)[0]].copy()
+            for i in range(self.n_drones):
+                obs[i][-3:] = shared_fire_location
         return np.stack(obs)
 
     def step(self, actions, seen_grids=None):
@@ -1193,8 +1198,8 @@ def main():
     all_scenarios = sorted(list(scenario_names.keys()))
 
     # Ask whether to include the final test (section 2) for the chosen scenario
-    use_final_test_input = input("Include final test (section 2) after training for the chosen scenario? (y/n): ").strip().lower()
-    use_final_test = use_final_test_input == 'y'
+    run_test_only_input = input("Run test scenario? (y/n): ").strip().lower()
+    run_test_only = run_test_only_input == 'y'
 
     print("Available scenarios (choose one):")
     for s in all_scenarios:
@@ -1332,10 +1337,13 @@ def main():
                     except Exception:
                         print(f"Failed to load legacy agent file '{legacy}'. Training will start from scratch for scenario {scenario}.")
         # Each scenario is divided into two sections as requested. Sections 1 and 2
-        # Section 1..5 are curriculum levels; section 2 is used as final test when requested
-        sections = [1]
-        if use_final_test:
-            sections = [1, 2]
+        # If running test only, skip section 1 and only run section 2
+        if run_test_only:
+            sections = [2]
+            print("[INFO] Running ONLY test scenario (section 2). Section 1 will be skipped.")
+        else:
+            sections = [1]
+            print("[INFO] Running training scenario (section 1). Section 2 will be skipped.")
         for section in sections:
             for curriculum_level in range(5):  # 5 curriculum levels per scenario
                 print(f"  --- SECTION {section} - CURRICULUM LEVEL {curriculum_level + 1}/5 ---")
@@ -2099,15 +2107,30 @@ def main():
         # Evaluate deterministic actor on grid (no candidate noise)
         xs = np.arange(x_range[0], x_range[1], res)
         ys = np.arange(y_range[0], y_range[1], res)
-        grid = np.zeros((len(xs), len(ys), 3), dtype=np.float32)
+        grid = np.zeros((len(xs), len(ys), env.action_space.shape[1]), dtype=np.float32)
+        # Determine expected observation length from env
+        obs_len = env.observation_space.shape[1]
         for ix, x in enumerate(xs):
             for iy, y in enumerate(ys):
-                # z fixed to 7.5 for decision map
-                obs = np.array([x, y, 7.5, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+                # Build a minimal observation matching current env obs shape.
+                # Default: [x, y, z, fire_below, other_x, other_y, other_z, fire_x, fire_y, fire_z]
+                z = 7.5
+                if obs_len == 10:
+                    obs = np.array([x, y, z, 0.0, x, y, z, 0.0, 0.0, 0.0], dtype=np.float32)
+                else:
+                    # Fallback for older shapes - try to fill first 7 dims
+                    obs = np.zeros((obs_len,), dtype=np.float32)
+                    obs[0:3] = np.array([x, y, z])
+                    if obs_len > 3:
+                        obs[3] = 0.0
                 # deterministic actor
-                with torch.no_grad():
-                    act = agent.actor(torch.tensor(obs, dtype=torch.float32).unsqueeze(0)).cpu().numpy()[0]
-                grid[ix, iy] = act
+                try:
+                    with torch.no_grad():
+                        act = agent.actor(torch.tensor(obs, dtype=torch.float32).unsqueeze(0)).cpu().numpy()[0]
+                    grid[ix, iy] = act
+                except Exception as e:
+                    print(f"Failed to evaluate actor for obs len={obs_len}: {e}")
+                    grid[ix, iy] = np.zeros(env.action_space.shape[1], dtype=np.float32)
         # Save grid and axes for plotting
         np.save(fname, {'xs': xs, 'ys': ys, 'grid': grid})
         print(f"Wrote decision map to {fname}")
