@@ -1,0 +1,9 @@
+gymnasium
+numpy
+torch
+matplotlib
+pandas
+seaborn
+os
+numpy
+pathlib

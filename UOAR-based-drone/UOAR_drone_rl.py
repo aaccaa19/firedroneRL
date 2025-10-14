@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import csv
 from pathlib import Path
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+import shutil
 
 # --- TUNABLE CONSTANTS (centralized) ---
 # Reward/penalty scaling
@@ -16,26 +17,40 @@ TIMEOUT_PENALTY = -20.0
 # Backwards-compatible alias (some code paths may still reference TERMINAL_PENALTY)
 TERMINAL_PENALTY = COLLISION_PENALTY
 
-# Energy: smaller coefficient and tighter clipping to avoid domination
-ENERGY_COEF = 0.002   # smaller coefficient for per-step energy magnitude
+# Energy: tuned to avoid dominating other reward signals
+# Reduce the raw energy coefficient and make the penalty apply only when
+# energy is above a moving baseline. This prevents the agent from being
+# driven to no-op policies to avoid energy cost.
+ENERGY_COEF = 0.0008   # reduced coefficient for per-step energy magnitude
 # Per-step clip for energy-based penalty (post-baseline subtraction)
-ENERGY_CLIP = 1.0     # tighter clip to avoid huge single-step penalties
+ENERGY_CLIP = 0.5     # tighter clip to avoid huge single-step penalties
 REWARD_CLIP = 50.0
 NORMALIZED_REWARD_CLIP = 5.0
-PROXIMITY_SCALE = 18.0
-OPTIMAL_BONUS = 12.0
+PROXIMITY_SCALE = 22.0
+OPTIMAL_BONUS = 8.0
 # Per-component weights to balance reward components (prox, exploration, energy)
+# Increase exploration weight so finding new fires and scanning matter more
+# Weights for normalized components
 PROX_WEIGHT = 1.5
-EXPL_WEIGHT = 0.6
-# Lower energy weight significantly so it no longer drowns other signals
-ENERGY_WEIGHT = 0.00008
+# Increase exploration weight so finding new fires and scanning matter more
+EXPL_WEIGHT = 1.2
+# Lower energy weight significantly so it no longer drowns other signals.
+# This is applied conservatively in-step (only for positive deviations).
+ENERGY_WEIGHT = 0.000001
+
+# Movement encouragement: small positive bonus when the drone moves
+# purposefully (helps avoid static policies that minimize energy by not moving)
+# Movement encouragement: small positive bonus when the drone moves
+# purposefully (helps avoid static policies that minimize energy by not moving)
+MOVEMENT_BONUS_THRESHOLD = 0.75
+MOVEMENT_BONUS = 1.5
 # Small L2 regularizer on policy actions to discourage saturation (in actor loss)
 ACT_REG = 1e-2
 
 # Replay / normalization warm-up
 REPLAY_WARMUP = 20000  # env steps before training/normalizing rewards
 # Increase warmup transitions so normalization and critic updates are stable
-N_WARMUP_TRANSITIONS = 10000  # transitions to collect before using normalization
+N_WARMUP_TRANSITIONS = 2000  # transitions to collect before using normalization (reduced to start normalizing sooner)
 
 # Optional small actor-side energy regularizer (penalize large action magnitudes)
 ENERGY_ACT_REG = 2e-3
@@ -106,10 +121,10 @@ class DroneEnv(gym.Env):
             self.fire_centers = [center]
             self.fire_radius = 2.5  # Large fire size for scenario 6
         self.action_space = spaces.Box(low=-1, high=1, shape=(self.n_drones,3), dtype=np.float32)
-        # Each drone: [x, y, z, fire_below, other_x, other_y, other_z]
-        low = np.array([0,0,0,0,0,0,0]*self.n_drones).reshape((self.n_drones,7))
-        high = np.array([area_size,area_size,area_size,1,area_size,area_size,area_size]*self.n_drones).reshape((self.n_drones,7))
-        self.observation_space = spaces.Box(low=low, high=high, shape=(self.n_drones,7), dtype=np.float32)
+    # Each drone: [x, y, z, fire_below, other_x, other_y, other_z, fire_x, fire_y, fire_z]
+        low = np.array([0,0,0,0,0,0,0,0,0,0]*self.n_drones).reshape((self.n_drones,10))
+        high = np.array([area_size,area_size,area_size,1,area_size,area_size,area_size,area_size,area_size,area_size]*self.n_drones).reshape((self.n_drones,10))
+        self.observation_space = spaces.Box(low=low, high=high, shape=(self.n_drones,10), dtype=np.float32)
         # --- Add cell_rewards for regenerating reward ---
         grid_size = 0.5
         grid_dim = int(self.area_size // grid_size)
@@ -174,7 +189,6 @@ class DroneEnv(gym.Env):
     def _get_obs(self):
         # Each drone sees a cone on the ground; the higher it is, the larger the cone
         def point_to_segment_dist_2d(p, a, b):
-            # 2D distance from point p to segment ab
             ap = p - a
             ab = b - a
             t = np.dot(ap, ab) / (np.dot(ab, ab) + 1e-8)
@@ -182,29 +196,29 @@ class DroneEnv(gym.Env):
             closest = a + t * ab
             return np.linalg.norm(p - closest)
         def is_blocked_by_fire(drone_xy, fire_centers_2d, fire_radius, target_xy):
-            # Returns True if a fire is between drone_xy and target_xy
             for fc in fire_centers_2d:
-                # Ensure fc is 2D for all calculations
                 fc2d = fc[:2] if fc.shape[0] > 2 else fc
-                # Vector from drone to fire and drone to target
                 v_fire = fc2d - drone_xy
                 v_target = (target_xy[:2] if target_xy.shape[0] > 2 else target_xy) - drone_xy
                 dist_to_fire = np.linalg.norm(v_fire)
                 dist_to_target = np.linalg.norm(v_target)
                 if dist_to_fire < dist_to_target and dist_to_fire > 1e-6:
-                    # Angle between vectors
                     cos_angle = np.dot(v_fire, v_target) / (dist_to_fire * dist_to_target + 1e-8)
-                    if cos_angle > 0.99:  # ~8 deg cone, adjust as needed
-                        # Check if fire center is close to the line from drone to target
+                    if cos_angle > 0.99:
                         proj = np.dot(v_fire, v_target) / (np.linalg.norm(v_target) + 1e-8)
                         closest = drone_xy + v_target / np.linalg.norm(v_target) * proj
                         if np.linalg.norm(fc2d - closest) <= fire_radius:
                             return True
             return False
+
         obs = []
-        k = 0.5  # scaling factor for cone radius (reduced by half)
+        k = 0.5
         fire_a_2d = np.array([self.fire_line[0][0], self.fire_line[0][1]])
         fire_b_2d = np.array([self.fire_line[1][0], self.fire_line[1][1]])
+
+        # Track fires seen by any drone this step
+        fires_seen = set()
+        fire_locations = []
         for i in range(self.n_drones):
             pos = self.drone_pos[i]
             other = self.drone_pos[1-i]
@@ -212,28 +226,34 @@ class DroneEnv(gym.Env):
             z = pos[2]
             view_radius = k * z / 8
             fire_in_view = 0.0
-            # For all scenarios, check occlusion by fire (cannot see behind fire)
+            fire_seen_location = np.array([0.0, 0.0, 0.0])
             fire_centers_2d = np.array([[fc[0], fc[1]] for fc in self.fire_centers]) if self.fire_centers else np.empty((0,2))
-            # For scenario 1 and 5, treat the fire line or wall as a set of closely spaced fire centers for occlusion
             if (self.scenario == 1 or self.scenario == 5) and fire_centers_2d.shape[0] == 0:
-                # Discretize the fire line/wall into points for occlusion
                 n_points = 20
                 if self.scenario == 1:
                     a, b = self.fire_line[0], self.fire_line[1]
                 else:
-                    # Wall at x=fire_wall_x, spanning y and z
                     a = np.array([self.fire_wall_x, 0])
                     b = np.array([self.fire_wall_x, self.area_size])
                 fire_centers_2d = np.array([a + (b - a) * t for t in np.linspace(0, 1, n_points)])
-            # Check if any fire is visible (not blocked by another fire)
-            for fc in fire_centers_2d:
+            for idx, fc in enumerate(self.fire_centers):
                 dist = np.linalg.norm(drone_xy - fc[:2])
                 if dist <= (view_radius + self.fire_radius):
                     blocked = is_blocked_by_fire(drone_xy, fire_centers_2d, self.fire_radius, fc)
                     if not blocked:
                         fire_in_view = 1.0
+                        fire_seen_location = fc.copy()
+                        fires_seen.add(idx)
                         break
-            obs.append(np.concatenate([pos, [fire_in_view], other]))
+            fire_locations.append(fire_seen_location)
+            obs.append(np.concatenate([pos, [fire_in_view], other, fire_seen_location]))
+
+        # If any drone saw a fire, share the location with all drones
+        if fires_seen:
+            # Use the first seen fire location for all drones
+            shared_fire_location = self.fire_centers[list(fires_seen)[0]].copy()
+            for i in range(self.n_drones):
+                obs[i][-3:] = shared_fire_location
         return np.stack(obs)
 
     def step(self, actions, seen_grids=None):
@@ -302,8 +322,13 @@ class DroneEnv(gym.Env):
         for i in range(self.n_drones):
             # For scenarios 2, 3, 4, 6: use fire_centers; for 1 and 5: use fire_line
             if self.scenario in [2, 3, 4, 6]:
-                dists = [np.linalg.norm(self.drone_pos[i] - fc) for fc in self.fire_centers]
-                min_dist = min(dists)
+                # Defensive: avoid min() on empty fire_centers
+                if not getattr(self, 'fire_centers', None):
+                    dists = []
+                    min_dist = float('inf')
+                else:
+                    dists = [np.linalg.norm(self.drone_pos[i] - fc) for fc in self.fire_centers]
+                    min_dist = min(dists) if dists else float('inf')
                 collision_dist = self.drone_radius + self.fire_radius
                 min_safe_dist = self.drone_radius + self.fire_radius + self.safety_margin
                 # If inside the fire (distance to center < fire_radius), apply same penalty everywhere
@@ -314,8 +339,9 @@ class DroneEnv(gym.Env):
                 # --- Proximity reward logic for keeping average fire distance near 1 ---
                 optimal_dist = 1.0
                 distance_error = abs(min_dist - optimal_dist)
-                # Small bounded proximal encouragement scaled by PROXIMITY_SCALE
-                prox = PROXIMITY_SCALE * max(0, 1 - distance_error)
+                # Gaussian-shaped proximal encouragement centered at optimal_dist=1.0
+                sigma = 0.4
+                prox = PROXIMITY_SCALE * np.exp(-0.5 * (distance_error / sigma) ** 2)
                 rewards[i] += PROX_WEIGHT * prox
                 proximity_contrib[i] += PROX_WEIGHT * prox
                 if min_dist > optimal_dist + 1.0:
@@ -344,9 +370,27 @@ class DroneEnv(gym.Env):
                 exp_reward = proximity_scale * np.exp(-alpha * safe_distance)
                 rewards[i] += PROX_WEIGHT * exp_reward
                 proximity_contrib[i] += PROX_WEIGHT * exp_reward
+                # Small lateral/patrol bonus: encourage movement parallel to fire line
+                try:
+                    # compute local tangent along fire line (2D) and drone horizontal velocity (approx)
+                    fire_dir = np.array(self.fire_line[1][:2]) - np.array(self.fire_line[0][:2])
+                    fire_dir = fire_dir / (np.linalg.norm(fire_dir) + 1e-8)
+                    # approximate drone horizontal velocity from prev_positions if available
+                    if hasattr(self, 'prev_positions') and self.prev_positions[i] is not None:
+                        horiz_vel = (self.drone_pos[i][:2] - self.prev_positions[i][:2])
+                        horiz_speed = np.linalg.norm(horiz_vel)
+                        if horiz_speed > 1e-6:
+                            vel_dir = horiz_vel / horiz_speed
+                            alignment = float(np.dot(vel_dir, fire_dir))
+                            lateral_bonus = 0.5 * max(0.0, abs(alignment)) * horiz_speed
+                            rewards[i] += PROX_WEIGHT * lateral_bonus
+                            proximity_contrib[i] += PROX_WEIGHT * lateral_bonus
+                except Exception:
+                    pass
                 # Additional bonus for being in optimal range (just outside safety margin)
+                # Only apply the optimal bonus when the actual distance to fire is <= 1.0
                 optimal_range = 0.3  # Distance beyond safety margin that's considered optimal
-                if safe_distance <= optimal_range:
+                if safe_distance <= optimal_range and min_dist <= 1.0:
                     optimal_bonus = OPTIMAL_BONUS * (1 - safe_distance / optimal_range)
                     rewards[i] += PROX_WEIGHT * optimal_bonus
                     proximity_contrib[i] += PROX_WEIGHT * optimal_bonus
@@ -402,7 +446,8 @@ class DroneEnv(gym.Env):
                         if not occluded:
                             seen_mask[gx, gy] = True
         # Give reduced reward for seen cells, reset their reward to 0
-        exploration_scale = 0.05  # Reduced impact of exploration (smaller to avoid large totals)
+        # Increase exploration impact so that scanning/discovery is more attractive
+        exploration_scale = 0.20  # increased further to encourage scanning
         # Iterate cells and distribute clamped per-cell reward to drones equally
         for gx in range(grid_dim):
             for gy in range(grid_dim):
@@ -444,12 +489,15 @@ class DroneEnv(gym.Env):
 
         for i in range(self.n_drones):
             pos = self.drone_pos[i]
-            # Penalty for staying in the same place for too long
+            # Penalty for staying in the same place for too long; small movement bonus otherwise
             if self.prev_positions[i] is not None:
                 movement = np.linalg.norm(pos - self.prev_positions[i])
-                # Reduced movement penalty to avoid large accumulated negatives
-                if movement < 0.15:  # threshold for 'staying still'
-                    rewards[i] -= 1.0
+                # If drone moves a meaningful amount, give a small positive bonus to encourage exploration
+                if movement >= MOVEMENT_BONUS_THRESHOLD:
+                    rewards[i] += MOVEMENT_BONUS
+                else:
+                    # Mild penalty for remaining almost stationary (reduced magnitude)
+                    rewards[i] -= 0.5
 
             self.prev_positions[i] = pos.copy()
             # Exploration bonus for discovering new fires
@@ -457,7 +505,8 @@ class DroneEnv(gym.Env):
                 dist_to_fire = np.linalg.norm(pos - fc)
                 if dist_to_fire < (self.fire_radius + self.safety_margin + 1.0):
                     if idx not in self.fires_visited[i]:
-                        bonus = 20.0
+                        # Increase discovery bonus to encourage finding and investigating fires
+                        bonus = 160.0
                         rewards[i] += EXPL_WEIGHT * bonus
                         exploration_contrib[i] += EXPL_WEIGHT * bonus
                         self.fires_visited[i].add(idx)
@@ -489,11 +538,12 @@ class DroneEnv(gym.Env):
                 energy_raw = energy_coeff * float(np.mean(np.abs(da)))
                 # update EMA baseline
                 self.energy_ema = (1 - self.energy_ema_alpha) * self.energy_ema + self.energy_ema_alpha * energy_raw
+                # relative energy above baseline only
                 energy_rel = energy_raw - self.energy_ema
-                # Clip to avoid huge single-step penalties
-                energy_rel = float(np.clip(energy_rel, -ENERGY_CLIP, ENERGY_CLIP))
-                # Subtract weighted penalty
-                energy_penalty = ENERGY_WEIGHT * energy_rel
+                # Only penalize when relative energy is positive (i.e., above baseline)
+                energy_rel_pos = float(np.clip(energy_rel, 0.0, ENERGY_CLIP))
+                # Subtract weighted penalty (apply conservatively)
+                energy_penalty = ENERGY_WEIGHT * energy_rel_pos
                 rewards[i] -= energy_penalty
                 # record for logging (store raw and relative versions)
                 energy_components[i] = float(energy_raw)
@@ -801,7 +851,7 @@ class TD3Agent:
     def decay_noise(self, decay_rate=0.99, min_noise=0.01):
         """Decay the noise levels by decay_rate, not going below min_noise."""
         self.noise_levels = [max(n * decay_rate, min_noise) for n in self.noise_levels]
-    def __init__(self, area_size, drone_radius, fire_line, fire_radius, safety_margin, max_step_size, obs_dim=7, act_dim=3, n_critics=2, n_candidates=30, noise_levels=None, gamma=0.95, tau=0.005, policy_noise=0.12, noise_clip=0.25, policy_delay=2, buffer_size=200000, batch_size=2048, hidden_size=384):
+    def __init__(self, area_size, drone_radius, fire_line, fire_radius, safety_margin, max_step_size, obs_dim=7, act_dim=3, n_critics=2, n_candidates=30, noise_levels=None, gamma=0.95, tau=0.005, policy_noise=0.12, noise_clip=0.25, policy_delay=2, buffer_size=200000, batch_size=256, hidden_size=384):
         if noise_levels is None:
             # stronger initial candidate noise for exploration
             noise_levels = [0.1, 0.2, 0.3, 0.5]
@@ -889,6 +939,8 @@ class TD3Agent:
         # Generate actions that move towards optimal distance from fire
         min_safe_dist = self.drone_radius + self.fire_radius + self.safety_margin
         optimal_dist = min_safe_dist + 0.15  # Slightly outside safety margin
+        # Enforce user constraint: optimal distance cannot go above 1.0
+        optimal_dist = min(optimal_dist, 1.0)
         
         if dist_to_fire > optimal_dist + 0.5:
             # Too far - move towards fire
@@ -954,10 +1006,11 @@ class TD3Agent:
                 proximity_scale = PROXIMITY_SCALE
                 immediate_reward = proximity_scale * np.exp(-alpha * safe_distance)
 
-                # Add small optimal range bonus
+                # Add small optimal range bonus (clamped optimal distance near 1.0)
                 optimal_range = 0.3
                 if safe_distance <= optimal_range:
-                    optimal_bonus = 20 * (1 - safe_distance / optimal_range)
+                    # Use shared OPTIMAL_BONUS constant for consistency
+                    optimal_bonus = OPTIMAL_BONUS * (1 - safe_distance / optimal_range)
                     immediate_reward += optimal_bonus
             
             # Long-term Q (average over critics)
@@ -966,10 +1019,10 @@ class TD3Agent:
             q_vals = [critic(obs_t, act_t).item() for critic in self.critics]
             avg_q = np.mean(q_vals)
             
-            # Estimate candidate energy (squared delta of action magnitude relative to zero)
+            # Estimate candidate energy (squared magnitude)
             est_energy = float(np.sum(a ** 2) / max(1, a.size))
-            # Weighted score: immediate reward + discounted Q - small energy penalty
-            energy_penalty_est = ENERGY_WEIGHT * est_energy * 1.0  # stronger estimated penalty
+            # Apply a much smaller penalty during candidate scoring so exploration isn't squashed
+            energy_penalty_est = (ENERGY_WEIGHT * 0.25) * est_energy
             score = immediate_reward + self.gamma * avg_q - energy_penalty_est
             scores.append(score)
         
@@ -1141,23 +1194,42 @@ class TD3Agent:
 # --- MAIN LOOP ---
 def main():
     import os
-    scenario_names = {1: "Static Fire Line", 3: "Line of Fires", 2: "Spreading Fire", 4: "Random Fires", 5: "Impassable Fire Wall (w/ Random Crash)", 6: "Central Fire"}
-    all_scenarios = [1, 3, 2, 4, 5, 6]
-    print("Available scenarios:")
+    scenario_names = {1: "Static Fire Line", 2: "Spreading Fire", 3: "Line of Fires", 4: "Random Fires", 5: "Impassable Fire Wall (w/ Random Crash)", 6: "Central Fire"}
+    all_scenarios = sorted(list(scenario_names.keys()))
+
+    # Ask whether to include the final test (section 2) for the chosen scenario
+    run_test_only_input = input("Run test scenario? (y/n): ").strip().lower()
+    run_test_only = run_test_only_input == 'y'
+
+    print("Available scenarios (choose one):")
     for s in all_scenarios:
         print(f"  {s}: {scenario_names[s]}")
-    user_input = input("Enter scenario numbers to run, separated by commas (e.g., 1,3,4,1): ").strip()
-    if user_input:
-        try:
-            scenarios = [int(x) for x in user_input.split(',') if int(x) in all_scenarios]
-            if not scenarios:
-                print("No valid scenarios selected. Running all by default.")
-                scenarios = all_scenarios
-        except Exception:
-            print("Invalid input. Running all scenarios by default.")
-            scenarios = all_scenarios
-    else:
-        scenarios = all_scenarios
+    user_input = input("Enter a single scenario number to run (e.g., 1): ").strip()
+    try:
+        scenario_choice = int(user_input)
+        if scenario_choice in all_scenarios:
+            scenarios = [scenario_choice]
+        else:
+            print("Invalid scenario selected. Defaulting to scenario 1.")
+            scenarios = [all_scenarios[0]]
+    except Exception:
+        print("No valid input. Defaulting to scenario 1.")
+        scenarios = [all_scenarios[0]]
+
+    # Ask user for configurable run parameters
+    try:
+        curriculum_episodes = int(input("Enter number of episodes per curriculum level (e.g. 1): ").strip())
+        if curriculum_episodes < 1:
+            curriculum_episodes = 1
+    except Exception:
+        curriculum_episodes = 1
+
+    try:
+        steps_per_episode = int(input("Enter maximum steps per episode (e.g. 300): ").strip())
+        if steps_per_episode < 1:
+            steps_per_episode = 300
+    except Exception:
+        steps_per_episode = 300
     # Ask user if they want to see visualization at the end of each scenario
     vis_input = input("Show visualization at the end of each scenario? (y/n): ").strip().lower()
     show_vis_each = vis_input == 'y'
@@ -1166,23 +1238,8 @@ def main():
     episode_rewards = [[], []]  # Store total points per episode for each drone
     avg_fire_distances = [[], []]  # Track average distance to fire per episode
 
-    # Initialize agents ONCE so they retain learning across scenarios
-    env = DroneEnv(curriculum_level=0, scenario=1)
-    obs_dim = env.observation_space.shape[1]
-    act_dim = env.action_space.shape[1]
-    agents = [TD3Agent(
-        area_size=env.area_size,
-        drone_radius=env.drone_radius,
-        fire_line=env.fire_line,
-        fire_radius=env.fire_radius,
-        safety_margin=env.safety_margin,
-        max_step_size=env.max_step_size,
-        obs_dim=obs_dim,
-        act_dim=act_dim
-    ) for _ in range(env.n_drones)]
-
-    # Per-component normalizer for logging and optional normalization
-    reward_normalizer = RewardNormalizer(warmup=N_WARMUP_TRANSITIONS, clip=3.0)
+    # NOTE: agents will be created per-scenario so each scenario trains its own policy
+    # Per-component normalizer will also be created per-scenario inside the scenario loop
 
     # Prepare logs directory and CSV files (overwrite existing logs for a fresh run)
     logs_dir = Path("logs")
@@ -1192,7 +1249,7 @@ def main():
     # Open and write headers
     training_fp = open(training_csv_path, 'w', newline='')
     training_writer = csv.writer(training_fp)
-    training_writer.writerow(["episode", "total_reward", "length", "success", "collisions", "avg_goal_dist", "crash_types", "proximity_component", "exploration_component", "energy_component", "normalized_total", "norm_prox_mean", "norm_expl_mean", "norm_energy_mean", "action_saturation_fraction", "actor_loss", "critic_loss", "td_error"])
+    training_writer.writerow(["episode", "total_reward", "length", "success", "collisions", "avg_goal_dist", "crash_types", "proximity_component", "exploration_component", "energy_component", "fires_discovered", "normalized_total", "norm_prox_mean", "norm_expl_mean", "norm_energy_mean", "action_saturation_fraction", "actor_loss", "critic_loss", "td_error"])
 
     steps_fp = open(steps_csv_path, 'w', newline='')
     steps_writer = csv.writer(steps_fp)
@@ -1216,19 +1273,8 @@ def main():
 
     # Ask user if they want to load previous training or start from scratch
     load_choice = input("Load previous training from pickle file? (y/n): ").strip().lower()
-    if load_choice == 'y' and os.path.exists("td3_agent_0.pkl"):
-        agents[0].load("td3_agent_0.pkl")
-        # Copy agent 0's weights to agent 1
-        agents[1].actor.load_state_dict(agents[0].actor.state_dict())
-        agents[1].actor_target.load_state_dict(agents[0].actor_target.state_dict())
-        for i in range(len(agents[1].critics)):
-            agents[1].critics[i].load_state_dict(agents[0].critics[i].state_dict())
-            agents[1].critics_target[i].load_state_dict(agents[0].critics_target[i].state_dict())
-        agents[1].actor_opt.load_state_dict(agents[0].actor_opt.state_dict())
-        for i in range(len(agents[1].critic_opts)):
-            agents[1].critic_opts[i].load_state_dict(agents[0].critic_opts[i].state_dict())
-        agents[1].buffer.__dict__.update(agents[0].buffer.__dict__)
-        print("Loaded agent 0 and copied weights to agent 1.")
+    if load_choice == 'y':
+        print("Will attempt to load scenario-specific agent pickle files when each scenario is started.")
     else:
         print("Training will start from scratch.")
 
@@ -1236,12 +1282,176 @@ def main():
         print(f"\n=== SCENARIO {scenario}: {scenario_names[scenario]} ===")
         last_episode_states = None
         last_episode_fire_centers = None
-        for curriculum_level in range(5):  # 5 curriculum levels per scenario
-            print(f"  --- CURRICULUM LEVEL {curriculum_level + 1}/5 ---")
-            env = DroneEnv(curriculum_level=curriculum_level, scenario=scenario)
-            print(f"  Safety margin for this level: {env.safety_margin:.2f}")
-            for episode in range(curriculum_episodes):
-                obs, _ = env.reset()
+        # Create fresh environment for scenario to query shapes and defaults
+        env = DroneEnv(curriculum_level=0, scenario=scenario)
+        obs_dim = env.observation_space.shape[1]
+        act_dim = env.action_space.shape[1]
+        # instantiate agents for this scenario (each scenario gets its own policy set)
+        agents = [TD3Agent(
+            area_size=env.area_size,
+            drone_radius=env.drone_radius,
+            fire_line=env.fire_line,
+            fire_radius=env.fire_radius,
+            safety_margin=env.safety_margin,
+            max_step_size=env.max_step_size,
+            obs_dim=obs_dim,
+            act_dim=act_dim
+        ) for _ in range(env.n_drones)]
+        # Per-component normalizer for logging and optional normalization (per-scenario)
+        reward_normalizer = RewardNormalizer(warmup=N_WARMUP_TRANSITIONS, clip=3.0)
+
+        # Attempt to load existing scenario-specific agents if the user requested loading
+        if load_choice == 'y':
+            loaded_any = False
+            for i in range(len(agents)):
+                fname = f"td3_agent_s{scenario}_agent_{i}.pkl"
+                try:
+                    if os.path.exists(fname):
+                        agents[i].load(fname)
+                        loaded_any = True
+                        print(f"Loaded existing agent file {fname} for scenario {scenario}, agent {i}")
+                except Exception:
+                    print(f"Failed to load {fname} for scenario {scenario}, agent {i}")
+            # Legacy fallback: if no scenario-specific files found, attempt to load td3_agent_0.pkl
+            if not loaded_any:
+                legacy = "td3_agent_0.pkl"
+                if os.path.exists(legacy):
+                    try:
+                        agents[0].load(legacy)
+                        # Copy weights/state to other agents
+                        for j in range(1, len(agents)):
+                            agents[j].actor.load_state_dict(agents[0].actor.state_dict())
+                            agents[j].actor_target.load_state_dict(agents[0].actor_target.state_dict())
+                            for k in range(len(agents[j].critics)):
+                                agents[j].critics[k].load_state_dict(agents[0].critics[k].state_dict())
+                                agents[j].critics_target[k].load_state_dict(agents[0].critics_target[k].state_dict())
+                            agents[j].actor_opt.load_state_dict(agents[0].actor_opt.state_dict())
+                            for k in range(len(agents[j].critic_opts)):
+                                agents[j].critic_opts[k].load_state_dict(agents[0].critic_opts[k].state_dict())
+                            # Copy replay buffer state if present for agent 0
+                            try:
+                                agents[j].buffer.__dict__.update(agents[0].buffer.__dict__)
+                            except Exception:
+                                pass
+                        print(f"Loaded legacy agent '{legacy}' and copied weights to scenario agents.")
+                    except Exception:
+                        print(f"Failed to load legacy agent file '{legacy}'. Training will start from scratch for scenario {scenario}.")
+        # Each scenario is divided into two sections as requested. Sections 1 and 2
+        # If running test only, skip section 1 and only run section 2
+        if run_test_only:
+            sections = [2]
+            print("[INFO] Running ONLY test scenario (section 2). Section 1 will be skipped.")
+        else:
+            sections = [1]
+            print("[INFO] Running training scenario (section 1). Section 2 will be skipped.")
+        for section in sections:
+            for curriculum_level in range(5):  # 5 curriculum levels per scenario
+                print(f"  --- SECTION {section} - CURRICULUM LEVEL {curriculum_level + 1}/5 ---")
+                env = DroneEnv(curriculum_level=curriculum_level, scenario=scenario)
+                print(f"  Safety margin for this level: {env.safety_margin:.2f}")
+                for episode in range(curriculum_episodes):
+                    obs, _ = env.reset()
+                    # After reset, override starts/fires per scenario-section rules
+                    # Default fixed start points (user-specified)
+                    fixed_start_1 = np.array([10.0, 10.0, 10.0])
+                    fixed_start_2 = np.array([0.0, 0.0, 10.0])
+                    # SECTION overrides
+                    if scenario == 1:
+                        if section == 1:
+                            env.drone_pos = np.stack([fixed_start_1, fixed_start_2])
+                        else:
+                            # start within 1 unit of the original assigned start point
+                            def jitter_around(pt, r=1.0):
+                                theta = np.random.uniform(0, 2*np.pi)
+                                rad = np.random.uniform(0, r)
+                                dx = rad * np.cos(theta)
+                                dy = rad * np.sin(theta)
+                                dz = np.random.uniform(-0.5, 0.5)
+                                np_pt = pt + np.array([dx, dy, dz])
+                                np_pt[0] = np.clip(np_pt[0], 0, env.area_size)
+                                np_pt[1] = np.clip(np_pt[1], 0, env.area_size)
+                                np_pt[2] = np.clip(np_pt[2], 5, 10)
+                                return np_pt
+                            env.drone_pos = np.stack([jitter_around(fixed_start_1), jitter_around(fixed_start_2)])
+                        # fire_line behavior remains as default (static)
+                    elif scenario == 4:
+                        if section == 1:
+                            env.drone_pos = np.stack([fixed_start_1, fixed_start_2])
+                            # fixed fires at provided coordinates (z set to 7.5)
+                            env.fire_centers = [np.array([5.0,5.0,7.5]), np.array([2.0,2.0,7.5]), np.array([8.0,8.0,7.5]), np.array([2.0,8.0,7.5]), np.array([8.0,2.0,7.5])]
+                        else:
+                            env.drone_pos = np.stack([fixed_start_1, fixed_start_2])
+                            # 5 randomly placed fires not on drone start points
+                            env.fire_centers = []
+                            tries = 0
+                            while len(env.fire_centers) < 5 and tries < 200:
+                                tries += 1
+                                x = np.random.uniform(1, env.area_size-1)
+                                y = np.random.uniform(1, env.area_size-1)
+                                z = np.random.uniform(5, 10)
+                                pt = np.array([x,y,z])
+                                if np.min([np.linalg.norm(pt - dp) for dp in env.drone_pos]) > 1.0:
+                                    env.fire_centers.append(pt)
+                    elif scenario == 3:
+                        if section == 1:
+                            env.drone_pos = np.stack([fixed_start_2, fixed_start_1])
+                        else:
+                            # random starts not on fire start places
+                            env.drone_pos = []
+                            tries = 0
+                            while len(env.drone_pos) < env.n_drones and tries < 200:
+                                tries += 1
+                                pt = np.array([np.random.uniform(0.5, env.area_size-0.5), np.random.uniform(0.5, env.area_size-0.5), np.random.uniform(5,10)])
+                                if env.fire_centers:
+                                    if np.min([np.linalg.norm(pt - fc) for fc in env.fire_centers]) > 1.0:
+                                        env.drone_pos.append(pt)
+                                else:
+                                    env.drone_pos.append(pt)
+                            env.drone_pos = np.stack(env.drone_pos)
+                    elif scenario == 2:
+                        # Section 1: deterministic timed fire spawns at specific coords
+                        env.drone_pos = np.stack([fixed_start_2, fixed_start_1])
+                        if section == 1:
+                            # start with the first fire at (5,5)
+                            env.fire_centers = [np.array([5.0,5.0,7.5])]
+                            # Prepare a schedule for subsequent fires
+                            env._scheduled_spawns = [(20, np.array([2.0,2.0,7.5])), (40, np.array([8.0,8.0,7.5])), (60, np.array([2.0,8.0,7.5])), (80, np.array([8.0,2.0,7.5]))]
+                        else:
+                            # Section 2: start with a fire at (5,5) and then spawn a random fire every 30 steps
+                            env.fire_centers = [np.array([5.0,5.0,7.5])]
+                            env._scheduled_spawns = []
+                    elif scenario == 5 or scenario == 6:
+                        if section == 1:
+                            env.drone_pos = np.stack([fixed_start_2, fixed_start_1])
+                        else:
+                            env.drone_pos = []
+                            tries = 0
+                            while len(env.drone_pos) < env.n_drones and tries < 200:
+                                tries += 1
+                                pt = np.array([np.random.uniform(0.5, env.area_size-0.5), np.random.uniform(0.5, env.area_size-0.5), np.random.uniform(5,10)])
+                                # ensure not on any fire (if present)
+                                good = True
+                                if hasattr(env, 'fire_centers') and env.fire_centers:
+                                    if np.min([np.linalg.norm(pt - fc) for fc in env.fire_centers]) <= 1.0:
+                                        good = False
+                                if good:
+                                    env.drone_pos.append(pt)
+                            if isinstance(env.drone_pos, list):
+                                env.drone_pos = np.stack(env.drone_pos)
+                    else:
+                        # default safety - keep reset positions
+                        pass
+                    # refresh observation to match overridden drone positions / fires
+                    try:
+                        obs = env._get_obs()
+                    except Exception:
+                        obs, _ = env.reset()
+                # Ensure per-episode discovery tracking is reset
+                try:
+                    env.fires_visited = [set() for _ in range(env.n_drones)]
+                except Exception:
+                    # Fallback: attach attribute if missing
+                    env.fires_visited = [set() for _ in range(env.n_drones)]
                 done = [False, False]
                 total_reward = [0, 0]
                 fire_distances = [[], []]  # Track fire distances during episode
@@ -1261,7 +1471,7 @@ def main():
                 episode_actions = []
                 rewards = [0, 0]  # Initialize rewards before first step
 
-                while not all(done) and steps < 300:
+                while not all(done) and steps < steps_per_episode:
                     actions = np.zeros((env.n_drones, 3))
                     for i in range(env.n_drones):
                         if not done[i]:
@@ -1297,9 +1507,12 @@ def main():
                     for i in range(env.n_drones):
                         if not done[i]:
                             if env.scenario == 2:
-                                # Closest fire center
-                                dists = [np.linalg.norm(next_obs[i][:3] - fc) for fc in env.fire_centers]
-                                dist_to_fire = min(dists)
+                                # Closest fire center (defensive: handle empty fire list)
+                                if not getattr(env, 'fire_centers', None):
+                                    dist_to_fire = float('inf')
+                                else:
+                                    dists = [np.linalg.norm(next_obs[i][:3] - fc) for fc in env.fire_centers]
+                                    dist_to_fire = min(dists) if dists else float('inf')
                             else:
                                 dist_to_fire = point_to_segment_dist(next_obs[i][:3], env.fire_line[0], env.fire_line[1])
                             fire_distances[i].append(dist_to_fire)
@@ -1396,7 +1609,12 @@ def main():
                         except Exception:
                             episode_normalized_components = [[] for _ in range(env.n_drones)]
                         try:
-                            episode_normalized_components[i].append((exploration_norm, proximity_norm, energy_norm, normalized_total))
+                            # Clip per-step normalized_total to avoid extreme artifacts
+                            try:
+                                clipped_norm_total = float(np.clip(normalized_total, -float(NORMALIZED_REWARD_CLIP), float(NORMALIZED_REWARD_CLIP))) if normalized_total is not None else float('nan')
+                            except Exception:
+                                clipped_norm_total = float('nan')
+                            episode_normalized_components[i].append((exploration_norm, proximity_norm, energy_norm, clipped_norm_total))
                         except Exception:
                             episode_normalized_components[i].append((float('nan'), float('nan'), float('nan'), float('nan')))
                         # If env provided component breakdown in info, record for logging
@@ -1444,6 +1662,41 @@ def main():
                     obs = next_obs
                     steps += 1
                     global_step += 1
+
+                    # Process any scheduled spawns for scenario 2 (timed deterministic fire spawns)
+                    try:
+                        if hasattr(env, '_scheduled_spawns') and env._scheduled_spawns:
+                            # env._scheduled_spawns is list of (spawn_step, np.array([x,y,z]))
+                            remaining = []
+                            for spawn_step, spawn_pt in env._scheduled_spawns:
+                                if steps >= spawn_step:
+                                    # Only add if not too close to any drone start/position
+                                    if all(np.linalg.norm(spawn_pt - dp) > 1.0 for dp in env.drone_pos):
+                                        env.fire_centers.append(spawn_pt)
+                                else:
+                                    remaining.append((spawn_step, spawn_pt))
+                            env._scheduled_spawns = remaining
+                    except Exception:
+                        pass
+
+                    # For scenario 2, section 2: spawn a random fire every 30 steps (not on drone positions)
+                    try:
+                        if scenario == 2 and 'section' in locals() and section == 2:
+                            # Only spawn if we have fewer than 7 fires
+                            if steps > 0 and steps % 30 == 0 and len(getattr(env, 'fire_centers', [])) < 7:
+                                tries = 0
+                                while tries < 50:
+                                    tries += 1
+                                    x = np.random.uniform(1, env.area_size-1)
+                                    y = np.random.uniform(1, env.area_size-1)
+                                    z = np.random.uniform(5, 10)
+                                    pt = np.array([x, y, z])
+                                    # ensure spawn not on any drone
+                                    if all(np.linalg.norm(pt - dp) > 1.0 for dp in env.drone_pos):
+                                        env.fire_centers.append(pt)
+                                        break
+                    except Exception:
+                        pass
 
                 # Save last episode's states for visualization
                 if curriculum_level == 4 and episode == curriculum_episodes - 1:
@@ -1596,7 +1849,12 @@ def main():
                 except Exception:
                     norm_prox_mean = norm_expl_mean = norm_energy_mean = float('nan')
 
-                training_writer.writerow([global_episode_counter, float(np.mean(total_reward)), int(steps), success, int(collisions), float(avg_goal_dist), ";".join([str(ct) for ct in crash_type]), prox_comp, expl_comp, energy_comp, norm_total, norm_prox_mean, norm_expl_mean, norm_energy_mean, action_saturation_fraction, actor_loss_log, critic_loss_log, td_error_log])
+                # Count fires discovered this episode (drone 0 used as representative; sum unique discoveries across drones)
+                try:
+                    fires_discovered = sum(len(s) for s in getattr(env, 'fires_visited', [set() for _ in range(env.n_drones)]))
+                except Exception:
+                    fires_discovered = 0
+                training_writer.writerow([global_episode_counter, float(np.mean(total_reward)), int(steps), success, int(collisions), float(avg_goal_dist), ";".join([str(ct) for ct in crash_type]), prox_comp, expl_comp, energy_comp, int(fires_discovered), norm_total, norm_prox_mean, norm_expl_mean, norm_energy_mean, action_saturation_fraction, actor_loss_log, critic_loss_log, td_error_log])
 
                 # Write per-step rows (log only drone 0 for compactness)
                 # When writing per-step rows, attempt to split reward into components if possible.
@@ -1650,10 +1908,18 @@ def main():
 
                     steps_writer.writerow([global_episode_counter, t, float(st[0]), float(st[1]), float(st[2]), float(act[0]), float(act[1]), float(act[2]), reward_step_clamped, exploration_comp, proximity_comp, energy_val, expl_norm, prox_norm, energy_norm, norm_reward_step, td_error_val, action_saturation, 0])
 
-                print(f"Episode {scenario_episode}/{5 * curriculum_episodes} (Scenario {scenario}, Level {curriculum_level+1}) Total Rewards: {[round(r, 1) for r in total_reward]}")
+                # Human-friendly episode summary
+                end_msgs = []
                 for i in range(env.n_drones):
+                    if crash_type[i] is None:
+                        end_reason = 'completed'
+                    else:
+                        end_reason = crash_type[i]
                     avg_dist = avg_fire_distances[i][-1] if avg_fire_distances[i] else float('inf')
-                    print(f"  Drone {i+1}: Total Points = {total_reward[i]:.1f}, Avg Fire Distance = {avg_dist:.2f}, Ended by: {crash_type[i]}")
+                    end_msgs.append(f"Drone {i+1}: Total Points = {total_reward[i]:.1f}, Avg Fire Distance = {avg_dist:.2f}, Ended by: {end_reason}")
+                print(f"Episode {scenario_episode}/{5 * curriculum_episodes} (Scenario {scenario}, Level {curriculum_level+1}) Total Rewards: {[round(r, 1) for r in total_reward]}")
+                for m in end_msgs:
+                    print('  ' + m)
 
                 # Decay noise for all agents after each episode
                 for agent in agents:
@@ -1841,36 +2107,74 @@ def main():
         # Evaluate deterministic actor on grid (no candidate noise)
         xs = np.arange(x_range[0], x_range[1], res)
         ys = np.arange(y_range[0], y_range[1], res)
-        grid = np.zeros((len(xs), len(ys), 3), dtype=np.float32)
+        grid = np.zeros((len(xs), len(ys), env.action_space.shape[1]), dtype=np.float32)
+        # Determine expected observation length from env
+        obs_len = env.observation_space.shape[1]
         for ix, x in enumerate(xs):
             for iy, y in enumerate(ys):
-                # z fixed to 7.5 for decision map
-                obs = np.array([x, y, 7.5, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+                # Build a minimal observation matching current env obs shape.
+                # Default: [x, y, z, fire_below, other_x, other_y, other_z, fire_x, fire_y, fire_z]
+                z = 7.5
+                if obs_len == 10:
+                    obs = np.array([x, y, z, 0.0, x, y, z, 0.0, 0.0, 0.0], dtype=np.float32)
+                else:
+                    # Fallback for older shapes - try to fill first 7 dims
+                    obs = np.zeros((obs_len,), dtype=np.float32)
+                    obs[0:3] = np.array([x, y, z])
+                    if obs_len > 3:
+                        obs[3] = 0.0
                 # deterministic actor
-                with torch.no_grad():
-                    act = agent.actor(torch.tensor(obs, dtype=torch.float32).unsqueeze(0)).cpu().numpy()[0]
-                grid[ix, iy] = act
+                try:
+                    with torch.no_grad():
+                        act = agent.actor(torch.tensor(obs, dtype=torch.float32).unsqueeze(0)).cpu().numpy()[0]
+                    grid[ix, iy] = act
+                except Exception as e:
+                    print(f"Failed to evaluate actor for obs len={obs_len}: {e}")
+                    grid[ix, iy] = np.zeros(env.action_space.shape[1], dtype=np.float32)
         # Save grid and axes for plotting
         np.save(fname, {'xs': xs, 'ys': ys, 'grid': grid})
         print(f"Wrote decision map to {fname}")
 
-    save_input = input(f"Save trained agents to file? (y/n): ").strip().lower()
-    if save_input == 'y':
-        for i, agent in enumerate(agents):
-            fname = f"td3_agent_{i}.pkl"
-            if os.path.exists(fname):
-                overwrite = input(f"File '{fname}' exists. Overwrite? (y/n): ").strip().lower()
-                if overwrite != 'y':
-                    print(f"Skipping save for agent {i}.")
-                    continue
-            agent.save(fname)
-            print(f"Saved agent {i} to '{fname}'.")
-            # Export decision map for agent 0 only (helpful for plotting)
-            if i == 0:
+    # Non-interactive auto-save when running in SMOKE_RUN mode
+    smoke_env = os.environ.get('SMOKE_RUN', '0')
+    try:
+        smoke_episodes = int(smoke_env)
+    except Exception:
+        smoke_episodes = 0
+    if smoke_episodes > 0:
+        # Auto-save agent 0 to a deterministic filename for later inspection
+        try:
+            # If an existing file is present, back it up first
+            dst = f'td3_agent_s{scenario}_agent_0.pkl'
+            if os.path.exists(dst):
+                bak = dst + '.bak'
                 try:
-                    export_decision_map(agent, env)
-                except Exception as e:
-                    print("Failed to export decision map:", e)
+                    shutil.copyfile(dst, bak)
+                    print(f"Backed up existing '{dst}' to '{bak}'")
+                except Exception:
+                    pass
+            agents[0].save(dst)
+            print(f"Auto-saved agent 0 to '{dst}' (SMOKE_RUN mode)")
+        except Exception as e:
+            print("Failed to auto-save agent in SMOKE_RUN mode:", e)
+    else:
+        save_input = input(f"Save trained agents to file? (y/n): ").strip().lower()
+        if save_input == 'y':
+            for i, agent in enumerate(agents):
+                fname = f"td3_agent_s{scenario}_agent_{i}.pkl"
+                if os.path.exists(fname):
+                    overwrite = input(f"File '{fname}' exists. Overwrite? (y/n): ").strip().lower()
+                    if overwrite != 'y':
+                        print(f"Skipping save for agent {i}.")
+                        continue
+                agent.save(fname)
+                print(f"Saved agent {i} to '{fname}'.")
+                # Export decision map for agent 0 only (helpful for plotting)
+                if i == 0:
+                    try:
+                        export_decision_map(agent, env)
+                    except Exception as e:
+                        print("Failed to export decision map:", e)
 
     # Close log files if open
     try:
@@ -1891,8 +2195,14 @@ def main():
 
 if __name__ == "__main__":
     import os
-    if os.environ.get('SMOKE_RUN', '0') == '1':
-        # Minimal non-interactive smoke run for quick validation
+    # Support SMOKE_RUN as an integer number of episodes (e.g. SMOKE_RUN=100)
+    smoke_env = os.environ.get('SMOKE_RUN', '0')
+    try:
+        smoke_episodes = int(smoke_env)
+    except Exception:
+        smoke_episodes = 0
+    if smoke_episodes > 0:
+        # Minimal non-interactive smoke run for quick validation; uses smoke_episodes
         def smoke_run(episodes=10):
             env = DroneEnv(scenario=1)
             obs, _ = env.reset()
@@ -1913,6 +2223,6 @@ if __name__ == "__main__":
                     obs = next_obs
                     steps += 1
             print('SMOKE_RUN_COMPLETE')
-        smoke_run(episodes=10)
+        smoke_run(episodes=smoke_episodes)
     else:
         main()
