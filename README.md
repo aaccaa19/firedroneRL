@@ -1,11 +1,9 @@
-````markdown
 # FiredroneRL — Drone exploration and fire-avoidance (UOAR)
 
 This repository contains an environment, agent, training loop and analysis tools for Unmanned Online Area Reconnaissance (UOAR) with drones. The project includes a Gym-compatible environment, a TD3-like continuous-action agent, logging, plotting utilities, and small helper scripts.
-
 Contents
 --------
-- `UOAR-based-drone/UOAR_drone_rl.py` — Main environment (`DroneEnv`), agent (`TD3Agent`), training loop and utilities.
+- `drl-based-drone/UOAR_drone_rl.py` — Main environment (`DroneEnv`), agent (`TD3Agent`), training loop and utilities.
 - `analysis/plot_all_figures.py` — Plotting/analysis utilities for training logs and decision maps.
 - `logs/` — Default location for runtime logs (CSV + exported artifacts).
 - `outputs/plots/` — Generated PNGs from the analysis scripts.
@@ -18,10 +16,16 @@ Quickstart
 pip install -r requirements.txt
 ```
 
+Optionally install as a local editable package (adds console entry points if configured):
+
+```powershell
+pip install -e .
+```
+
 2. Run the training/interactive loop:
 
 ```powershell
-python UOAR-based-drone/UOAR_drone_rl.py
+python drl-based-drone/UOAR_drone_rl.py
 ```
 
 The script is interactive by default and will prompt you to choose scenarios, save agents, and optionally run analysis plots.
@@ -29,7 +33,7 @@ The script is interactive by default and will prompt you to choose scenarios, sa
 Non-interactive smoke run example:
 
 ```powershell
-$env:SMOKE_RUN=10; python UOAR-based-drone/UOAR_drone_rl.py
+$env:SMOKE_RUN=10; python drl-based-drone/UOAR_drone_rl.py
 ```
 
 What changed recently
@@ -52,17 +56,11 @@ python analysis/plot_all_figures.py
 
 This script reads `logs/training_metrics.csv` and `logs/steps.csv` and writes PNGs to `outputs/plots/`.
 
-Cleaning up docs
+There is also an `analysis/README.md` inside the `analysis/` folder that documents the plotting utilities and the expected log formats. (If it was removed, the main README contains the necessary quick instructions.)
+
+Rule-based drone
 ----------------
-- Duplicate README files were consolidated into this single root README. If you maintain separate documentation for analysis, reference this README and link the `analysis/` directory.
-
-Troubleshooting
----------------
-- Error: "could not broadcast input array from shape (10,) into shape (7,)"
-	- Cause: code was still assuming the old 7-dim observation format. Fix: update any code constructing observations (decision-map or tests) to use the env's `observation_space.shape[1]`.
-
-- Error while exporting decision map: "mat1 and mat2 shapes cannot be multiplied"
-	- Cause: actor network expected a different input dimension than provided observation. Fix: rebuild actor with correct `obs_dim` or adapt the decision map to feed the actor a matching sized vector.
+This project contains a small rule-based drone implementation (a simple deterministic agent used for baseline/debugging). The rule-based drone follows heuristics such as moving toward unexplored cells and avoiding positions near the fire line; it is intended as a reference policy and not for training.
 
 Contact / Contributing
 ----------------------

@@ -189,8 +189,17 @@ def plot_trajectories(df_steps):
     sample_eps = sorted(df_steps['episode'].unique())[:20]
     fig, ax = plt.subplots(figsize=(6, 6))
     for ep in sample_eps:
-        g = df_steps[df_steps['episode'] == ep]
-        ax.plot(g['x'], g['y'], alpha=0.6)
+        g = df_steps[df_steps['episode'] == ep].reset_index(drop=True)
+        # Create a colormap from light red to deep red over the trajectory length
+        n = len(g)
+        if n < 2:
+            continue
+        cmap = plt.get_cmap('Reds')
+        # Map steps [0..n-1] to [0.25..1.0] on the colormap so start is lighter
+        vals = np.linspace(0.25, 1.0, n)
+        for i in range(n-1):
+            c = cmap(vals[i])
+            ax.plot([g.loc[i, 'x'], g.loc[i+1, 'x']], [g.loc[i, 'y'], g.loc[i+1, 'y']], color=c, linewidth=1.2)
     #ax.set_title('Trajectories (x,y)')
     ax.set_xlabel('x')
     ax.set_ylabel('y')

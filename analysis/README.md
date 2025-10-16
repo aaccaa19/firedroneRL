@@ -25,11 +25,13 @@ Files generated
 ---------------
 
 - 01_training_curve.png
+- 01b_avg_fire_distance.png
 - 02_length_and_success.png
 - 03_actor_loss.png
 - 03_critic_loss.png
 - 04_td_error_hist.png
 - 06_state_visitation.png
 - 07_trajectories.png
+- 08b_normalized_total.png
 - 10_q_value_heatmap.png
 - 12_decision_region.png

@@ -1,4 +1,4 @@
-include UOAR-based-drone/UOAR_drone_rl.py
+include drl-based-drone/UOAR_drone_rl.py
 recursive-include analysis *
-recursive-include UOAR-based-drone *
+recursive-include drl-based-drone *
 include README.md
