@@ -82,7 +82,7 @@ def load_or_synthesize():
 def save_fig(fig, name):
     path = OUT_DIR / name
     fig.tight_layout()
-    fig.savefig(path, dpi=350)
+    fig.savefig(path, dpi=500)
     plt.close(fig)
     print(f"Saved {path}")
 
@@ -95,7 +95,7 @@ def plot_training_curve(df_train):
     ax.set_ylabel('Total Reward')
     #ax.set_title('Training curve: total reward per episode')
     ax.legend()
-    save_fig(fig, '01_training_curve.png')
+    save_fig(fig, 'training_curve.png')
 
 
 def plot_avg_fire_distance(df_train):
@@ -108,7 +108,7 @@ def plot_avg_fire_distance(df_train):
     else:
         ax.text(0.5, 0.5, 'avg_goal_dist not available in logs', ha='center', va='center')
     ax.set_xlabel('Episode')
-    save_fig(fig, '01b_avg_fire_distance.png')
+    save_fig(fig, 'avg_fire_distance.png')
 
 
 def plot_length_and_success(df_train):
@@ -124,7 +124,7 @@ def plot_length_and_success(df_train):
     #axs[1].set_title(f'Success rate (rolling {window})')
     axs[1].set_xlabel('Episode')
     axs[1].set_ylabel('Success rate')
-    save_fig(fig, '02_length_and_success.png')
+    save_fig(fig, 'length_and_success.png')
 
 
 def plot_losses(df_train):
@@ -151,7 +151,7 @@ def plot_losses(df_train):
     ax1.set_xlabel('Episode')
     ax1.set_ylabel('Actor Loss (log scale)')
     #ax1.set_title('Actor loss curve')
-    save_fig(fig1, '03_actor_loss.png')
+    save_fig(fig1, 'actor_loss.png')
 
     fig2, ax2 = plt.subplots(figsize=(9, 4))
     ax2.plot(df_train['episode'], critic, label='critic_loss', color='C1')
@@ -159,7 +159,7 @@ def plot_losses(df_train):
     ax2.set_xlabel('Episode')
     ax2.set_ylabel('Critic Loss (log scale)')
     #ax2.set_title('Critic loss curve')
-    save_fig(fig2, '03_critic_loss.png')
+    save_fig(fig2, 'critic_loss.png')
 
 
 def plot_td_error_hist(df_steps):
@@ -171,7 +171,7 @@ def plot_td_error_hist(df_steps):
         ax.text(0.5, 0.5, 'No TD-error data available', ha='center', va='center')
         ax.set_xlabel('td_error')
         ax.set_ylabel('Count')
-    save_fig(fig, '04_td_error_hist.png')
+    save_fig(fig, 'td_error_hist.png')
 
 
 def plot_state_visitation(df_steps):
@@ -181,7 +181,7 @@ def plot_state_visitation(df_steps):
     #ax.set_title('State visitation heatmap (x,y)')
     ax.set_xlabel('x')
     ax.set_ylabel('y')
-    save_fig(fig, '06_state_visitation.png')
+    save_fig(fig, 'state_visitation.png')
 
 
 def plot_trajectories(df_steps):
@@ -203,7 +203,7 @@ def plot_trajectories(df_steps):
     #ax.set_title('Trajectories (x,y)')
     ax.set_xlabel('x')
     ax.set_ylabel('y')
-    save_fig(fig, '07_trajectories.png')
+    save_fig(fig, 'trajectories.png')
 
 
 def plot_reward_components(df_train):
@@ -232,7 +232,7 @@ def plot_normalized_total(df_train):
         ax.set_ylabel('Normalized Total')
     else:
         ax.text(0.5, 0.5, 'normalized_total not available in logs', ha='center', va='center')
-    save_fig(fig, '08b_normalized_total.png')
+    save_fig(fig, 'normalized_total.png')
 
 
 def plot_action_vs_state_slice(df_steps):
@@ -266,7 +266,7 @@ def plot_q_value_heatmap(df_steps):
     im = ax.imshow(np.nan_to_num(qgrid.T), origin='lower', aspect='auto', cmap='coolwarm')
     fig.colorbar(im, ax=ax, label='Q value (approx)')
     #ax.set_title('Approximate Q-value heatmap (binned x,y)')
-    save_fig(fig, '10_q_value_heatmap.png')
+    save_fig(fig, 'q_value_heatmap.png')
 
 def plot_decision_region(df_steps):
     # coarse grid showing most-frequent discretized action sign
@@ -289,7 +289,7 @@ def plot_decision_region(df_steps):
     #ax.set_title('Decision region (sign of action0)')
     ax.set_xlabel('x')
     ax.set_ylabel('y')
-    save_fig(fig, '12_decision_region.png')
+    save_fig(fig, 'decision_region.png')
 
 
 

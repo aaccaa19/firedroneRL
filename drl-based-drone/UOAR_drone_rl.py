@@ -8,6 +8,30 @@ import csv
 from pathlib import Path
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import shutil
+import re
+
+# Numeric string matcher for safe float conversion without try/except
+_NUMERIC_RE = re.compile(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$')
+
+def safe_float(x):
+    """Convert x to float without using try/except. Returns nan for non-numeric values."""
+    if isinstance(x, (int, float, np.floating, np.integer)):
+        return float(x)
+    if isinstance(x, str):
+        s = x.strip()
+        if _NUMERIC_RE.match(s):
+            return float(s)
+        return float('nan')
+    # For numpy scalar types
+    try:
+        # Avoid broad try/except in main logic; this is a narrow conversion for numpy scalars
+        if hasattr(x, 'item'):
+            v = x.item()
+            if isinstance(v, (int, float, np.floating, np.integer)):
+                return float(v)
+    except Exception:
+        pass
+    return float('nan')
 
 # --- TUNABLE CONSTANTS (centralized) ---
 # Reward/penalty scaling
@@ -38,6 +62,26 @@ EXPL_WEIGHT = 1.2
 # This is applied conservatively in-step (only for positive deviations).
 ENERGY_WEIGHT = 0.000001
 
+# Reward component switches for ablation studies. Toggle components on/off.
+# Keys: proximity, exploration, energy, edge, movement, discovery
+REWARD_COMPONENTS = {
+    'proximity': True,
+    'exploration': True,
+    'energy': True,
+    'edge': True,
+    'movement': True,
+    'discovery': True,
+    # finer-grained toggles
+    'lateral': True,              # lateral/patrol bonus along fire line
+    'optimal': True,              # small optimal-range bonus
+    'stationary_penalty': True,   # penalty for not moving
+    'cell_regen': True,           # whether unseen cells regenerate rewards
+}
+
+# Small L2 regularization on actor parameters to stabilize actor updates (helps prevent
+# runaway parameter growth when critics overestimate). Kept small by default.
+ACT_PARAM_REG = 5e-4  # slightly stronger L2 on actor params to prevent runaway growth
+
 # Movement encouragement: small positive bonus when the drone moves
 # purposefully (helps avoid static policies that minimize energy by not moving)
 # Movement encouragement: small positive bonus when the drone moves
@@ -56,8 +100,8 @@ N_WARMUP_TRANSITIONS = 2000  # transitions to collect before using normalization
 ENERGY_ACT_REG = 2e-3
 
 # Training / TD3 defaults
-TARGET_CLIP = 4.0     # slightly relaxed target clipping to preserve learning signal
-GRAD_CLIP_NORM = 1.0
+TARGET_CLIP = 1.0     # tighten target clipping further to avoid extreme critic targets
+GRAD_CLIP_NORM = 0.3  # reduce allowed gradient norm for safety
 # Actor regularization to discourage action saturation
 ACT_REG = 5e-3
 
@@ -429,12 +473,13 @@ class DroneEnv(gym.Env):
                 # Gaussian-shaped proximal encouragement centered at optimal_dist=1.0
                 sigma = 0.4
                 prox = PROXIMITY_SCALE * np.exp(-0.5 * (distance_error / sigma) ** 2)
-                rewards[i] += PROX_WEIGHT * prox
-                proximity_contrib[i] += PROX_WEIGHT * prox
-                if min_dist > optimal_dist + 1.0:
-                    pen = - (PROXIMITY_SCALE / 2.0) * (min_dist - optimal_dist)
-                    rewards[i] += PROX_WEIGHT * pen
-                    proximity_contrib[i] += PROX_WEIGHT * pen
+                if REWARD_COMPONENTS.get('proximity', True):
+                    rewards[i] += PROX_WEIGHT * prox
+                    proximity_contrib[i] += PROX_WEIGHT * prox
+                    if min_dist > optimal_dist + 1.0:
+                        pen = - (PROXIMITY_SCALE / 2.0) * (min_dist - optimal_dist)
+                        rewards[i] += PROX_WEIGHT * pen
+                        proximity_contrib[i] += PROX_WEIGHT * pen
             else:
                 min_dist = point_to_segment_dist(self.drone_pos[i], self.fire_line[0], self.fire_line[1])
                 collision_dist = self.drone_radius + self.fire_radius
@@ -455,32 +500,35 @@ class DroneEnv(gym.Env):
                 # Safe zone - exponential reward for proximity
                 safe_distance = min_dist - min_safe_dist
                 exp_reward = proximity_scale * np.exp(-alpha * safe_distance)
-                rewards[i] += PROX_WEIGHT * exp_reward
-                proximity_contrib[i] += PROX_WEIGHT * exp_reward
+                if REWARD_COMPONENTS.get('proximity', True):
+                    rewards[i] += PROX_WEIGHT * exp_reward
+                    proximity_contrib[i] += PROX_WEIGHT * exp_reward
                 # Small lateral/patrol bonus: encourage movement parallel to fire line
-                try:
-                    # compute local tangent along fire line (2D) and drone horizontal velocity (approx)
+                # compute local tangent along fire line (2D) and drone horizontal velocity (approx)
+                if hasattr(self, 'fire_line') and self.fire_line is not None:
                     fire_dir = np.array(self.fire_line[1][:2]) - np.array(self.fire_line[0][:2])
                     fire_dir = fire_dir / (np.linalg.norm(fire_dir) + 1e-8)
                     # approximate drone horizontal velocity from prev_positions if available
-                    if hasattr(self, 'prev_positions') and self.prev_positions[i] is not None:
-                        horiz_vel = (self.drone_pos[i][:2] - self.prev_positions[i][:2])
-                        horiz_speed = np.linalg.norm(horiz_vel)
-                        if horiz_speed > 1e-6:
-                            vel_dir = horiz_vel / horiz_speed
-                            alignment = float(np.dot(vel_dir, fire_dir))
-                            lateral_bonus = 0.5 * max(0.0, abs(alignment)) * horiz_speed
-                            rewards[i] += PROX_WEIGHT * lateral_bonus
-                            proximity_contrib[i] += PROX_WEIGHT * lateral_bonus
-                except Exception:
-                    pass
+                    if hasattr(self, 'prev_positions') and isinstance(self.prev_positions, (list, tuple)) and len(self.prev_positions) > i and self.prev_positions[i] is not None:
+                        prev_pos = self.prev_positions[i]
+                        if hasattr(prev_pos, '__getitem__'):
+                            horiz_vel = (self.drone_pos[i][:2] - prev_pos[:2])
+                            horiz_speed = np.linalg.norm(horiz_vel)
+                            if horiz_speed > 1e-6:
+                                vel_dir = horiz_vel / horiz_speed
+                                alignment = float(np.dot(vel_dir, fire_dir))
+                                lateral_bonus = 0.5 * max(0.0, abs(alignment)) * horiz_speed
+                                if REWARD_COMPONENTS.get('lateral', True):
+                                    rewards[i] += PROX_WEIGHT * lateral_bonus
+                                    proximity_contrib[i] += PROX_WEIGHT * lateral_bonus
                 # Additional bonus for being in optimal range (just outside safety margin)
                 # Only apply the optimal bonus when the actual distance to fire is <= 1.0
                 optimal_range = 0.3  # Distance beyond safety margin that's considered optimal
                 if safe_distance <= optimal_range and min_dist <= 1.0:
                     optimal_bonus = OPTIMAL_BONUS * (1 - safe_distance / optimal_range)
-                    rewards[i] += PROX_WEIGHT * optimal_bonus
-                    proximity_contrib[i] += PROX_WEIGHT * optimal_bonus
+                    if REWARD_COMPONENTS.get('optimal', True):
+                        rewards[i] += PROX_WEIGHT * optimal_bonus
+                        proximity_contrib[i] += PROX_WEIGHT * optimal_bonus
 
         # Drone-drone collision
         if np.linalg.norm(self.drone_pos[0] - self.drone_pos[1]) < 2*self.drone_radius + self.safety_margin:
@@ -532,6 +580,13 @@ class DroneEnv(gym.Env):
                                     break
                         if not occluded:
                             seen_mask[gx, gy] = True
+                            # If caller provided per-episode seen_grids (list of sets), record the seen grid cell
+                            try:
+                                if seen_grids is not None and isinstance(seen_grids, (list, tuple)) and len(seen_grids) > i:
+                                    # store as tuple (gx, gy)
+                                    seen_grids[i].add((int(gx), int(gy)))
+                            except Exception:
+                                pass
         # Give reduced reward for seen cells, reset their reward to 0
         # Increase exploration impact so that scanning/discovery is more attractive
         exploration_scale = 0.20  # increased further to encourage scanning
@@ -545,13 +600,15 @@ class DroneEnv(gym.Env):
                     reward = float(np.clip(reward, -REWARD_CLIP, REWARD_CLIP))
                     if reward != 0:
                         per_drone = reward / float(self.n_drones)
-                        for i in range(self.n_drones):
-                            rewards[i] += per_drone
-                            exploration_contrib[i] += per_drone
+                        if REWARD_COMPONENTS.get('exploration', True):
+                            for i in range(self.n_drones):
+                                rewards[i] += per_drone
+                                exploration_contrib[i] += per_drone
+                        # Always reset cell reward regardless of whether exploration is enabled
                         self.cell_rewards[gx, gy] = 0
                 else:
-                    # Regenerate reward for unseen cells
-                    if self.cell_rewards[gx, gy] < max_reward:
+                    # Regenerate reward for unseen cells (optional)
+                    if self.cell_rewards[gx, gy] < max_reward and REWARD_COMPONENTS.get('cell_regen', True):
                         self.cell_rewards[gx, gy] = min(max_reward, self.cell_rewards[gx, gy] + regen_rate)
 
         # Reduced edge penalty to not interfere with fire proximity
@@ -565,7 +622,8 @@ class DroneEnv(gym.Env):
             # Only apply edge penalty when very close to walls
             if min_dist < 1.0:  # Only within 1 unit of walls
                 edge_penalty = edge_penalty_scale * np.exp(-edge_penalty_alpha * min_dist)
-                rewards[i] -= edge_penalty
+                if REWARD_COMPONENTS.get('edge', True):
+                    rewards[i] -= edge_penalty
 
     # --- Custom penalties and exploration bonus ---
         # Track previous positions for each drone
@@ -581,10 +639,12 @@ class DroneEnv(gym.Env):
                 movement = np.linalg.norm(pos - self.prev_positions[i])
                 # If drone moves a meaningful amount, give a small positive bonus to encourage exploration
                 if movement >= MOVEMENT_BONUS_THRESHOLD:
-                    rewards[i] += MOVEMENT_BONUS
+                    if REWARD_COMPONENTS.get('movement', True):
+                        rewards[i] += MOVEMENT_BONUS
                 else:
                     # Mild penalty for remaining almost stationary (reduced magnitude)
-                    rewards[i] -= 0.5
+                    if REWARD_COMPONENTS.get('stationary_penalty', True):
+                        rewards[i] -= 0.5
 
             self.prev_positions[i] = pos.copy()
             # Exploration bonus for discovering new fires
@@ -594,8 +654,9 @@ class DroneEnv(gym.Env):
                     if idx not in self.fires_visited[i]:
                         # Increase discovery bonus to encourage finding and investigating fires
                         bonus = 160.0
-                        rewards[i] += EXPL_WEIGHT * bonus
-                        exploration_contrib[i] += EXPL_WEIGHT * bonus
+                        if REWARD_COMPONENTS.get('discovery', True):
+                            rewards[i] += EXPL_WEIGHT * bonus
+                            exploration_contrib[i] += EXPL_WEIGHT * bonus
                         self.fires_visited[i].add(idx)
 
         # Small per-step energy penalty computed from change in action (Δa) to encourage smooth control
@@ -614,31 +675,45 @@ class DroneEnv(gym.Env):
         # Track per-step energy components separately so logging can be precise
         energy_components = [0.0 for _ in range(self.n_drones)]
         for i in range(self.n_drones):
+            # Ensure actions index exists and is numeric
             try:
-                a = np.clip(actions[i], -1.0, 1.0)
-                # If prev action exists, penalize change in action; else use current magnitude as proxy
-                if hasattr(self, 'prev_actions') and self.prev_actions[i] is not None:
-                    da = a - self.prev_actions[i]
-                else:
-                    da = a
-                # energy measured as mean absolute delta (lower variance than squared)
-                energy_raw = energy_coeff * float(np.mean(np.abs(da)))
-                # update EMA baseline
-                self.energy_ema = (1 - self.energy_ema_alpha) * self.energy_ema + self.energy_ema_alpha * energy_raw
-                # relative energy above baseline only
-                energy_rel = energy_raw - self.energy_ema
-                # Only penalize when relative energy is positive (i.e., above baseline)
-                energy_rel_pos = float(np.clip(energy_rel, 0.0, ENERGY_CLIP))
-                # Subtract weighted penalty (apply conservatively)
-                energy_penalty = ENERGY_WEIGHT * energy_rel_pos
-                rewards[i] -= energy_penalty
-                # record for logging (store raw and relative versions)
-                energy_components[i] = float(energy_raw)
-                # Keep legacy 'energy' key as raw magnitude for downstream logging
-                info['energy'][i] = float(energy_raw)
+                a_raw = actions[i]
             except Exception:
                 energy_components[i] = float('nan')
-                info['energy'][i] = float('nan')
+                if 'energy' in info and isinstance(info['energy'], list) and len(info['energy']) > i:
+                    info['energy'][i] = float('nan')
+                continue
+            a = np.clip(a_raw, -1.0, 1.0)
+            # If prev action exists and has an entry for this drone, use it; else use current a
+            if hasattr(self, 'prev_actions') and isinstance(self.prev_actions, (list, tuple)) and len(self.prev_actions) > i and self.prev_actions[i] is not None:
+                da = a - self.prev_actions[i]
+            else:
+                da = a
+            # energy measured as mean absolute delta (lower variance than squared)
+            energy_raw = energy_coeff * float(np.mean(np.abs(da)))
+            # update EMA baseline
+            self.energy_ema = (1 - self.energy_ema_alpha) * self.energy_ema + self.energy_ema_alpha * energy_raw
+            # relative energy above baseline only
+            energy_rel = energy_raw - self.energy_ema
+            # Only penalize when relative energy is positive (i.e., above baseline)
+            energy_rel_pos = float(np.clip(energy_rel, 0.0, ENERGY_CLIP))
+            # Subtract weighted penalty (apply conservatively)
+            energy_penalty = ENERGY_WEIGHT * energy_rel_pos
+            if REWARD_COMPONENTS.get('energy', True):
+                rewards[i] -= energy_penalty
+            # record for logging (store raw and relative versions)
+            energy_components[i] = float(energy_raw)
+            # Keep legacy 'energy' key as raw magnitude for downstream logging
+            if 'energy' in info and isinstance(info['energy'], list) and len(info['energy']) > i:
+                info['energy'][i] = float(energy_raw)
+            elif 'energy' in info and isinstance(info['energy'], list):
+                # extend list defensively
+                try:
+                    info['energy'].append(float(energy_raw))
+                except Exception:
+                    pass
+            else:
+                info['energy'] = [float(energy_raw) for _ in range(self.n_drones)]
 
         # persist prev_actions for next step
         if not hasattr(self, 'prev_actions'):
@@ -861,11 +936,57 @@ class ReplayBuffer:
         self.next_obs = np.zeros((size, obs_dim), dtype=np.float32)
         self.done = np.zeros((size, 1), dtype=np.float32)
     def add(self, o, a, r, no, d):
-        self.obs[self.ptr] = o
-        self.act[self.ptr] = a
-        self.rew[self.ptr] = r
-        self.next_obs[self.ptr] = no
-        self.done[self.ptr] = d
+        # Defensive shape checks: attempt to adapt incoming arrays to buffer storage shape
+        o_arr = np.asarray(o, dtype=np.float32)
+        a_arr = np.asarray(a, dtype=np.float32)
+        no_arr = np.asarray(no, dtype=np.float32)
+
+        exp_obs_dim = self.obs.shape[1]
+        exp_act_dim = self.act.shape[1]
+
+        if o_arr.ndim == 0:
+            o_arr = np.array([o_arr], dtype=np.float32)
+
+        # Trim or pad observations if needed (best-effort). Warn on mismatch.
+        if o_arr.size != exp_obs_dim:
+            # If larger, trim; if smaller, pad with zeros
+            if o_arr.size > exp_obs_dim:
+                print(f"[ReplayBuffer] Warning: incoming obs size {o_arr.size} != buffer obs_dim {exp_obs_dim}; trimming to fit.")
+                o_trim = o_arr.flat[:exp_obs_dim]
+                o_arr = np.array(list(o_trim), dtype=np.float32)
+            else:
+                print(f"[ReplayBuffer] Warning: incoming obs size {o_arr.size} != buffer obs_dim {exp_obs_dim}; padding with zeros.")
+                pad = np.zeros((exp_obs_dim - o_arr.size,), dtype=np.float32)
+                o_arr = np.concatenate([o_arr.flatten(), pad])
+
+        if a_arr.ndim == 0:
+            a_arr = np.array([a_arr], dtype=np.float32)
+        if a_arr.size != exp_act_dim:
+            if a_arr.size > exp_act_dim:
+                print(f"[ReplayBuffer] Warning: incoming act size {a_arr.size} != buffer act_dim {exp_act_dim}; trimming to fit.")
+                a_arr = np.array(list(a_arr.flat[:exp_act_dim]), dtype=np.float32)
+            else:
+                print(f"[ReplayBuffer] Warning: incoming act size {a_arr.size} != buffer act_dim {exp_act_dim}; padding with zeros.")
+                pad = np.zeros((exp_act_dim - a_arr.size,), dtype=np.float32)
+                a_arr = np.concatenate([a_arr.flatten(), pad])
+
+        if no_arr.ndim == 0:
+            no_arr = np.array([no_arr], dtype=np.float32)
+        if no_arr.size != exp_obs_dim:
+            if no_arr.size > exp_obs_dim:
+                print(f"[ReplayBuffer] Warning: incoming next_obs size {no_arr.size} != buffer obs_dim {exp_obs_dim}; trimming to fit.")
+                no_arr = np.array(list(no_arr.flat[:exp_obs_dim]), dtype=np.float32)
+            else:
+                print(f"[ReplayBuffer] Warning: incoming next_obs size {no_arr.size} != buffer obs_dim {exp_obs_dim}; padding with zeros.")
+                pad = np.zeros((exp_obs_dim - no_arr.size,), dtype=np.float32)
+                no_arr = np.concatenate([no_arr.flatten(), pad])
+
+        # Ensure shapes for storage
+        self.obs[self.ptr] = o_arr.reshape((exp_obs_dim,))
+        self.act[self.ptr] = a_arr.reshape((exp_act_dim,))
+        self.rew[self.ptr] = np.array([float(r)], dtype=np.float32)
+        self.next_obs[self.ptr] = no_arr.reshape((exp_obs_dim,))
+        self.done[self.ptr] = np.array([float(d)], dtype=np.float32)
         self.ptr = (self.ptr + 1) % self.size
         if self.ptr == 0:
             self.full = True
@@ -881,6 +1002,37 @@ class ReplayBuffer:
             torch.tensor(self.next_obs[idx], dtype=torch.float32),
             torch.tensor(self.done[idx], dtype=torch.float32)
         )
+
+def _align_array(arr, expected_len, name='array'):
+    """Ensure a 1D numpy array `arr` has length `expected_len` by trimming or padding with zeros."""
+    a = np.asarray(arr, dtype=np.float32).flatten()
+    if a.size == expected_len:
+        return a
+    # Warn only once per unique mismatch key to avoid flooding the console
+    key = (name, int(a.size), int(expected_len))
+    if a.size > expected_len:
+        # trim
+        _warn_once(key, f"[align] Trimming {name} from size {a.size} to {expected_len}")
+        return a[:expected_len]
+    # pad
+    pad = np.zeros((expected_len - a.size,), dtype=np.float32)
+    _warn_once(key, f"[align] Padding {name} from size {a.size} to {expected_len}")
+    return np.concatenate([a, pad])
+
+
+_GLOBAL_WARNED = set()
+
+def _warn_once(key, msg):
+    """Print msg only the first time this key is seen."""
+    try:
+        k = tuple(key)
+    except Exception:
+        k = (str(key),)
+    if k in _GLOBAL_WARNED:
+        return
+    _GLOBAL_WARNED.add(k)
+    print(msg)
+
 
 class TD3Agent:
     def save(self, filename):
@@ -919,26 +1071,112 @@ class TD3Agent:
 
     def load(self, filename):
         import pickle
-        data = None
+        # Load checkpoint and only copy parameters that match by key and shape.
+        from pathlib import Path as _Path
+        ckpt_name = _Path(filename).name
         with open(filename, 'rb') as f:
             data = pickle.load(f)
-        self.actor.load_state_dict(data['actor'])
-        self.actor_target.load_state_dict(data['actor_target'])
-        for c, state in zip(self.critics, data['critics']):
-            c.load_state_dict(state)
-        for c, state in zip(self.critics_target, data['critics_target']):
-            c.load_state_dict(state)
-        self.actor_opt.load_state_dict(data['actor_opt'])
-        for opt, state in zip(self.critic_opts, data['critic_opts']):
-            opt.load_state_dict(state)
-        self.buffer.__dict__.update(data['buffer'])
-        # Optionally update params if needed
-        for k, v in data['params'].items():
-            setattr(self, k, v)
+
+        def _safe_copy_state_dict(model, checkpoint_sd, model_name="model"):
+            """Copy only matching keys (both present and same shape) from checkpoint_sd into model.
+            Any missing or shape-mismatched keys are skipped and reported.
+            """
+            model_sd = model.state_dict()
+            to_load = {}
+            skipped = []
+            for k, v in checkpoint_sd.items():
+                if k in model_sd:
+                    if model_sd[k].shape == v.shape:
+                        to_load[k] = v
+                    else:
+                        skipped.append(k)
+                else:
+                    skipped.append(k)
+            if to_load:
+                # load the subset without requiring strict key matching
+                model.load_state_dict(to_load, strict=False)
+            if skipped:
+                # print a concise warning about skipped keys (don't flood with full list)
+                short = skipped[:8]
+                more = len(skipped) - len(short)
+                msg = f"[load] Skipped {len(skipped)} parameters when loading {model_name}. Examples: {short}"
+                if more > 0:
+                    msg += f" (+{more} more)"
+                print(msg)
+
+        # Safe model weight restore
+        if 'actor' in data and isinstance(data['actor'], dict):
+            _safe_copy_state_dict(self.actor, data['actor'], model_name='actor')
+        if 'actor_target' in data and isinstance(data['actor_target'], dict):
+            _safe_copy_state_dict(self.actor_target, data['actor_target'], model_name='actor_target')
+        # Critics
+        if 'critics' in data and isinstance(data['critics'], (list, tuple)):
+            for i, state in enumerate(data['critics']):
+                if i < len(self.critics) and isinstance(state, dict):
+                    _safe_copy_state_dict(self.critics[i], state, model_name=f'critic_{i}')
+        if 'critics_target' in data and isinstance(data['critics_target'], (list, tuple)):
+            for i, state in enumerate(data['critics_target']):
+                if i < len(self.critics_target) and isinstance(state, dict):
+                    _safe_copy_state_dict(self.critics_target[i], state, model_name=f'critic_target_{i}')
+
+        # Do NOT restore optimizer state from checkpoints.
+        # Optimizer state dicts depend on parameter object ids and shapes and are brittle across
+        # architecture or shape changes. Restoring them can lead to mismatches during optimizer.step().
+        if 'actor_opt' in data:
+            _warn_once((ckpt_name, 'actor_opt'), f"[load:{ckpt_name}] Skipping actor optimizer state restore (optimizer state is not restored by default).")
+        if 'critic_opts' in data:
+            _warn_once((ckpt_name, 'critic_opts'), f"[load:{ckpt_name}] Skipping critic optimizer state restore (optimizer state is not restored by default).")
+
+        # Update parameters (whitelist to avoid stomping runtime-only attributes)
+        params = data.get('params', {}) if isinstance(data.get('params', {}), dict) else {}
+        # Do not overwrite obs_dim/act_dim from checkpoint - prefer current env dimensions to avoid buffer mismatches.
+        for k, v in params.items():
+            if k in ('obs_dim', 'act_dim'):
+                # Only warn when checkpoint value differs from current runtime value.
+                current = getattr(self, k, None)
+                equal = False
+                try:
+                    # numeric comparison when possible
+                    if isinstance(current, (int, float, np.integer, np.floating)) and isinstance(v, (int, float, np.integer, np.floating)):
+                        equal = float(current) == float(v)
+                    else:
+                        # Fallback to string compare for more complex objects
+                        equal = str(current) == str(v)
+                except Exception:
+                    equal = False
+                if not equal:
+                    _warn_once((ckpt_name, k), f"[load:{ckpt_name}] Skipping checkpoint parameter '{k}' (checkpoint={v}) to avoid incompatible model/buffer shapes; keeping current value={current}")
+                continue
+            if hasattr(self, k):
+                setattr(self, k, v)
+            else:
+                _warn_once((ckpt_name, k, 'unknown'), f"[load:{ckpt_name}] Skipping unknown parameter '{k}' from checkpoint")
+
+        # Restore replay buffer if present (best-effort) but only when shapes match the current buffer.
+        if 'buffer' in data and isinstance(data['buffer'], dict):
+            b = data['buffer']
+            try:
+                can_restore = True
+                # If the checkpoint contains numeric arrays for obs/act, ensure their second dim matches current buffer
+                if 'obs' in b and hasattr(b['obs'], 'shape'):
+                    if b['obs'].shape[1] != self.buffer.obs.shape[1]:
+                        can_restore = False
+                if 'next_obs' in b and hasattr(b['next_obs'], 'shape'):
+                    if b['next_obs'].shape[1] != self.buffer.next_obs.shape[1]:
+                        can_restore = False
+                if 'act' in b and hasattr(b['act'], 'shape'):
+                    if b['act'].shape[1] != self.buffer.act.shape[1]:
+                        can_restore = False
+                if can_restore:
+                    self.buffer.__dict__.update(b)
+                else:
+                    print('[load] Skipping replay buffer restore due to incompatible shapes between checkpoint and current agent (obs/act dims).')
+            except Exception:
+                print('[load] Warning: failed to fully restore replay buffer state; continuing with empty/partial buffer.')
     def decay_noise(self, decay_rate=0.99, min_noise=0.01):
         """Decay the noise levels by decay_rate, not going below min_noise."""
         self.noise_levels = [max(n * decay_rate, min_noise) for n in self.noise_levels]
-    def __init__(self, area_size, drone_radius, fire_line, fire_radius, safety_margin, max_step_size, obs_dim=7, act_dim=3, n_critics=2, n_candidates=30, noise_levels=None, gamma=0.95, tau=0.005, policy_noise=0.12, noise_clip=0.25, policy_delay=2, buffer_size=200000, batch_size=256, hidden_size=384):
+    def __init__(self, area_size, drone_radius, fire_line, fire_radius, safety_margin, max_step_size, obs_dim=7, act_dim=3, n_critics=2, n_candidates=30, noise_levels=None, gamma=0.95, tau=0.001, policy_noise=0.12, noise_clip=0.25, policy_delay=8, buffer_size=200000, batch_size=256, hidden_size=384):
         if noise_levels is None:
             # stronger initial candidate noise for exploration
             noise_levels = [0.1, 0.2, 0.3, 0.5]
@@ -959,9 +1197,11 @@ class TD3Agent:
         for i in range(n_critics):
             self.critics_target[i].load_state_dict(self.critics[i].state_dict())
         # Reduce actor/critic learning rates for stability
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=1e-4)
-        # Lower critic LR to stabilize training further
-        self.critic_opts = [torch.optim.Adam(c.parameters(), lr=5e-5) for c in self.critics]
+        # Lower the actor LR further to make actor updates gentler (helps stability)
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=1e-6)
+    # Lower critic LR and add small weight decay to stabilize critic updates
+    # Increase weight_decay slightly to discourage runaway critic weights
+        self.critic_opts = [torch.optim.Adam(c.parameters(), lr=1e-5, weight_decay=1e-5) for c in self.critics]
         self.buffer = ReplayBuffer(buffer_size, self.obs_dim, self.act_dim)
         self.gamma = gamma
         self.tau = tau
@@ -983,7 +1223,9 @@ class TD3Agent:
     def select_action(self, obs_np, deterministic=False):
         """Public API: return action. If deterministic=True, use raw actor output without candidate sampling."""
         if deterministic:
-            obs = torch.tensor(obs_np, dtype=torch.float32).unsqueeze(0)
+            # Align obs vector shape to expected obs_dim to avoid matmul errors
+            aligned = _align_array(obs_np, self.obs_dim, name='obs')
+            obs = torch.tensor(aligned, dtype=torch.float32).unsqueeze(0)
             with torch.no_grad():
                 a = self.actor(obs).cpu().numpy()[0]
             return np.clip(a, -1, 1)
@@ -991,7 +1233,9 @@ class TD3Agent:
             return self._select_action_candidates(obs_np, stochastic=True)
 
     def _select_action_candidates(self, obs_np, stochastic=True):
-        obs = torch.tensor(obs_np, dtype=torch.float32).unsqueeze(0)
+        # Align incoming observation to expected obs_dim
+        obs_aligned = _align_array(obs_np, self.obs_dim, name='obs')
+        obs = torch.tensor(obs_aligned, dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():
             base_action = self.actor(obs).cpu().numpy()[0]
         
@@ -1075,7 +1319,20 @@ class TD3Agent:
             fire_b = np.array([self.fire_line[1][0], self.fire_line[1][1], 0.0])
             dist_below = point_to_segment_dist(drone_xy0, fire_a, fire_b)
             fire_below = 1.0 if dist_below <= (self.fire_radius + 2) else 0.0
-            sim_obs = np.concatenate([sim_pos, [fire_below], obs_np[4:7]])
+            # Build a full-length simulated observation matching the env's observation layout
+            sim_obs = np.zeros((self.obs_dim,), dtype=np.float32)
+            # Fill base fields: [x,y,z, fire_below, other_x, other_y, other_z, fire_x, fire_y, fire_z]
+            sim_obs[0:3] = sim_pos[0:3]
+            sim_obs[3] = fire_below
+            # Copy the original obs_np other-drone coords and top-level fire info if available
+            # guard against short obs_np shapes (backwards compatibility)
+            try:
+                if len(obs_np) >= 7:
+                    sim_obs[4:7] = obs_np[4:7]
+                if len(obs_np) >= 10:
+                    sim_obs[7:10] = obs_np[7:10]
+            except Exception:
+                pass
             
             # Simulate immediate reward using the new reward function
             dist = point_to_segment_dist(sim_pos, self.fire_line[0], self.fire_line[1])
@@ -1101,8 +1358,11 @@ class TD3Agent:
                     immediate_reward += optimal_bonus
             
             # Long-term Q (average over critics)
-            obs_t = torch.tensor(sim_obs, dtype=torch.float32).unsqueeze(0)
-            act_t = torch.tensor(a, dtype=torch.float32).unsqueeze(0)
+            # Align simulated observation and action to expected dimensions
+            obs_sim_aligned = _align_array(sim_obs, self.obs_dim, name='sim_obs')
+            act_aligned = _align_array(a, self.act_dim, name='candidate_act')
+            obs_t = torch.tensor(obs_sim_aligned, dtype=torch.float32).unsqueeze(0)
+            act_t = torch.tensor(act_aligned, dtype=torch.float32).unsqueeze(0)
             q_vals = [critic(obs_t, act_t).item() for critic in self.critics]
             avg_q = np.mean(q_vals)
             
@@ -1115,17 +1375,21 @@ class TD3Agent:
         
         best_idx = int(np.argmax(scores))
         # Pick best candidate (avoid averaging that cancels directional components)
-        try:
-            return np.clip(np.array(candidates[best_idx], dtype=np.float32), -1, 1)
-        except Exception:
-            return np.clip(candidates[best_idx], -1, 1)
+        # Return clipped candidate; ensure index valid
+        if candidates and 0 <= best_idx < len(candidates):
+            arr = np.array(candidates[best_idx], dtype=np.float32)
+            return np.clip(arr, -1, 1)
+        else:
+            # Fallback: zero action
+            return np.zeros(self.act_dim, dtype=np.float32)
     def store(self, o, a, r, no, d):
         # Store raw clipped reward in buffer. We will normalize on-the-fly in train()
-        try:
+        # Convert reward to float and clamp deterministically
+        if r is None:
+            raw = float('nan')
+        else:
             raw = float(r)
-            clipped = float(np.clip(raw, -REWARD_CLIP, REWARD_CLIP))
-        except Exception:
-            clipped = float(r)
+        clipped = float(np.clip(raw, -REWARD_CLIP, REWARD_CLIP))
 
         # Add raw clipped reward to replay buffer
         self.buffer.add(o, a, clipped, no, d)
@@ -1158,11 +1422,14 @@ class TD3Agent:
                 r_std = (self.r_M2 / (self.r_count - 1)) ** 0.5
             else:
                 r_std = 1.0
-            try:
-                last_norm = float((clipped - self.r_mean) / (r_std + 1e-8))
+            # Compute last normalized reward defensively
+            # Compute last normalized reward defensively without exceptions
+            denom = (r_std + 1e-8)
+            if denom > 0:
+                last_norm = float((clipped - self.r_mean) / denom)
                 last_norm = float(np.clip(last_norm, -NORMALIZED_REWARD_CLIP, NORMALIZED_REWARD_CLIP))
                 self.last_normalized_reward = last_norm
-            except Exception:
+            else:
                 self.last_normalized_reward = float('nan')
         else:
             # Not normalizing yet; report clipped raw reward for logging
@@ -1194,10 +1461,33 @@ class TD3Agent:
             target = r + self.gamma * (1 - d) * min_target_q
             # Clamp targets to avoid extreme updates
             target = torch.clamp(target, -float(TARGET_CLIP), float(TARGET_CLIP))
+            # Log target statistics for diagnostics
+            try:
+                self.last_target_q_mean = float(min_target_q.mean().item())
+                self.last_target_q_std = float(min_target_q.std().item())
+            except Exception:
+                self.last_target_q_mean = float('nan')
+                self.last_target_q_std = float('nan')
+            # Divergence detector: if target Q_mean grows too large, suspend actor updates
+            try:
+                if hasattr(self, '_suspend_actor_until') and isinstance(self._suspend_actor_until, int):
+                    pass
+                # if target magnitude is huge, suspend actor for a short period
+                if abs(self.last_target_q_mean) > 20.0:
+                    # suspend for next 100 training iterations as a safety net
+                    self._suspend_actor_until = int(self.total_it + 100)
+                    print(f"[TD3Agent] Warning: large target_q_mean={self.last_target_q_mean:.3f}; suspending actor updates until total_it={self._suspend_actor_until}")
+            except Exception:
+                pass
         # record last normalized reward for diagnostics
-        try:
-            self.last_normalized_reward = float(r.mean().item())
-        except Exception:
+        if isinstance(r, torch.Tensor):
+            # r is a tensor; compute mean
+            try:
+                self.last_normalized_reward = float(r.mean().item())
+            except Exception:
+                # if something unexpected happens, fall back to nan
+                self.last_normalized_reward = float('nan')
+        else:
             self.last_normalized_reward = float('nan')
         # Critic update
         critic_losses = []
@@ -1220,56 +1510,107 @@ class TD3Agent:
             self.critic_opts[i].zero_grad()
             loss.backward()
             # Gradient clipping to avoid huge updates and record grad norm
-            try:
-                gn = torch.nn.utils.clip_grad_norm_(critic.parameters(), GRAD_CLIP_NORM)
+            # Gradient clipping to avoid huge updates and record grad norm
+            # Compute gradient norm if parameters exist
+            critic_params = list(critic.parameters())
+            if critic_params:
+                gn = torch.nn.utils.clip_grad_norm_(critic_params, GRAD_CLIP_NORM)
                 critic_grad_norms.append(float(gn))
-            except Exception:
+            else:
                 critic_grad_norms.append(float('nan'))
             self.critic_opts[i].step()
         # store last critic/td diagnostics for logging
-        try:
+        # Store last critic/td diagnostics defensively
+        # store last critic/td diagnostics defensively without broad exception handlers
+        if critic_losses:
             self.last_critic_loss = float(sum(critic_losses) / len(critic_losses))
-        except Exception:
+        else:
             self.last_critic_loss = float('nan')
-        try:
+        if td_errors:
             self.last_td_error = float(sum(td_errors) / len(td_errors))
-        except Exception:
+        else:
             self.last_td_error = float('nan')
-        try:
+        if q_mins and q_maxs:
             self.last_q_min = float(sum(q_mins) / len(q_mins))
             self.last_q_max = float(sum(q_maxs) / len(q_maxs))
-        except Exception:
+        else:
             self.last_q_min = float('nan')
             self.last_q_max = float('nan')
-        try:
-            # Average critic grad norm for logging
-            self.last_critic_grad_norm = float(np.nanmean(critic_grad_norms)) if critic_grad_norms else float('nan')
-        except Exception:
+        # Average critic grad norm for logging
+        if critic_grad_norms:
+            self.last_critic_grad_norm = float(np.nanmean(critic_grad_norms))
+        else:
             self.last_critic_grad_norm = float('nan')
         # Delayed policy update
         if self.total_it % self.policy_delay == 0:
-            # Actor loss with small L2 penalty on actions to discourage saturation
-            pred_actions = self.actor(o)
-            actor_loss = -self.critics[0](o, pred_actions).mean()
-            actor_loss = actor_loss + ACT_REG * (pred_actions ** 2).mean()
-            # Small actor-side energy regularizer (mean absolute action magnitude)
-            try:
-                actor_loss = actor_loss + ENERGY_ACT_REG * torch.mean(torch.abs(pred_actions))
-            except Exception:
-                pass
-            self.actor_opt.zero_grad()
-            actor_loss.backward()
-            # Clip actor grads too
-            try:
-                agn = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), GRAD_CLIP_NORM)
-                self.last_actor_grad_norm = float(agn)
-            except Exception:
-                self.last_actor_grad_norm = float('nan')
-            self.actor_opt.step()
-            # store last actor loss
-            try:
-                self.last_actor_loss = float(actor_loss.item())
-            except Exception:
+            # If divergence detector set a suspension window, skip actor updates until it expires
+            if hasattr(self, '_suspend_actor_until') and isinstance(self._suspend_actor_until, (int, float)) and self.total_it < int(self._suspend_actor_until):
+                # record a marker so logging knows actor update was skipped
+                self.last_actor_loss_raw = float('nan')
+                self.last_actor_loss = float('nan')
+                # still update critic targets with polyak to keep targets moving slowly if desired
+                # but skip actor gradient step entirely
+                # Optionally print a short message (kept concise)
+                # print(f"[TD3Agent] Actor update suspended at total_it={self.total_it}")
+            else:
+                # Actor loss: use the minimum critic across ensembles to reduce overestimation
+                # and add small regularization on both actions and actor parameters to stabilize
+                pred_actions = self.actor(o)
+                # Compute critic values for the current policy actions across all critics
+                try:
+                    q_vals = torch.stack([c(o, pred_actions) for c in self.critics], dim=0)  # (n_critics, batch, 1)
+                    q_min = torch.min(q_vals, dim=0).values  # (batch, 1)
+                    # Clamp Q-values used by actor to avoid runaway scaling from overestimated critics.
+                    # Bounds are conservative; adjust if your reward scale differs significantly.
+                    q_min = torch.clamp(q_min, min=-50.0, max=50.0)
+                    actor_loss = -q_min.mean()
+                    # Log actor-side Q statistics for diagnostics
+                    try:
+                        self.last_actor_q_mean = float(q_min.mean().item())
+                        self.last_actor_q_std = float(q_min.std().item())
+                    except Exception:
+                        self.last_actor_q_mean = float('nan')
+                        self.last_actor_q_std = float('nan')
+                except Exception:
+                    # Fallback to single critic if stacking fails for any reason
+                    actor_loss = -self.critics[0](o, pred_actions).mean()
+                # Action L2 regularizer (discourage large actions)
+                actor_loss = actor_loss + ACT_REG * (pred_actions ** 2).mean()
+                # Small actor-side energy regularizer (mean absolute action magnitude)
+                if 'ENERGY_ACT_REG' in globals() and isinstance(ENERGY_ACT_REG, (int, float)):
+                    actor_loss = actor_loss + ENERGY_ACT_REG * torch.mean(torch.abs(pred_actions))
+                # Small L2 penalty on actor parameters to help stabilize updates when critics are noisy
+                try:
+                    param_sq = 0.0
+                    for p in self.actor.parameters():
+                        param_sq = param_sq + torch.sum(p ** 2)
+                    actor_loss = actor_loss + ACT_PARAM_REG * param_sq
+                except Exception:
+                    pass
+                self.actor_opt.zero_grad()
+                actor_loss.backward()
+                # Clip actor grads too
+                actor_params = list(self.actor.parameters())
+                if actor_params:
+                    agn = torch.nn.utils.clip_grad_norm_(actor_params, GRAD_CLIP_NORM)
+                    self.last_actor_grad_norm = float(agn)
+                else:
+                    self.last_actor_grad_norm = float('nan')
+                self.actor_opt.step()
+                # store last actor loss
+            # Actor loss is defined as -Q(o, pi(o)).mean() so it will often be negative
+            # (because the critic Q is positive for good actions). For clearer logging
+            # we store both the raw value and a positive 'loss' that represents the
+            # quantity being minimized by the optimizer (i.e. -actor_loss_raw).
+            if hasattr(actor_loss, 'item'):
+                self.last_actor_loss_raw = float(actor_loss.item())
+                try:
+                    # positive_loss is what most monitoring plots expect (higher => worse)
+                    self.last_actor_loss = float(-self.last_actor_loss_raw)
+                except Exception:
+                    self.last_actor_loss = float(self.last_actor_loss_raw)
+            else:
+                self.last_actor_loss_raw = float('nan')
                 self.last_actor_loss = float('nan')
             # Polyak averaging
             for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
@@ -1284,22 +1625,23 @@ def main():
     scenario_names = {1: "Static Fire Line", 2: "Spreading Fire", 3: "Line of Fires", 4: "Random Fires", 5: "Impassable Fire Wall (w/ Random Crash)", 6: "Central Fire"}
     all_scenarios = sorted(list(scenario_names.keys()))
 
-    # Ask whether to include the final test (section 2) for the chosen scenario
-    run_test_only_input = input("Run test scenario? (y/n): ").strip().lower()
-    run_test_only = run_test_only_input == 'y'
+    # The training script no longer runs the final test scenario.
+    # Final/test runs should be executed using `final_environment.py` (standalone runner).
+    run_test_only = False
 
     print("Available scenarios (choose one):")
     for s in all_scenarios:
         print(f"  {s}: {scenario_names[s]}")
     user_input = input("Enter a single scenario number to run (e.g., 1): ").strip()
-    try:
+    # Validate numeric input explicitly
+    if isinstance(user_input, str) and user_input.lstrip('+-').isdigit():
         scenario_choice = int(user_input)
         if scenario_choice in all_scenarios:
             scenarios = [scenario_choice]
         else:
             print("Invalid scenario selected. Defaulting to scenario 1.")
             scenarios = [all_scenarios[0]]
-    except Exception:
+    else:
         print("No valid input. Defaulting to scenario 1.")
         scenarios = [all_scenarios[0]]
 
@@ -1310,21 +1652,22 @@ def main():
         if raw == '':
             print("Please enter a number (example: 30). This is the number of episodes per curriculum level.")
             continue
-        try:
+        if isinstance(raw, str) and raw.lstrip('+-').isdigit():
             curriculum_episodes = int(raw)
             if curriculum_episodes < 1:
                 print("Please enter an integer >= 1.")
                 continue
             break
-        except Exception:
+        else:
             print("Invalid input. Please type an integer (e.g. 30).")
             continue
 
-    try:
-        steps_per_episode = int(input("Enter maximum steps per episode (e.g. 300): ").strip())
+    raw_steps = input("Enter maximum steps per episode (e.g. 300): ").strip()
+    if isinstance(raw_steps, str) and raw_steps.lstrip('+-').isdigit():
+        steps_per_episode = int(raw_steps)
         if steps_per_episode < 1:
             steps_per_episode = 300
-    except Exception:
+    else:
         steps_per_episode = 300
     # Debug: show configured number of episodes per curriculum level
     print(f"Configured curriculum_episodes = {curriculum_episodes}")
@@ -1333,6 +1676,9 @@ def main():
     show_vis_each = False
 
     episode_rewards = [[], []]  # Store total points per episode for each drone
+    # Per-episode summaries for ablation/stats
+    episode_fires_viewed = []    # total fires viewed (sum across drones) per episode
+    episode_boxes_explored = []  # number of unique grid cells explored (union across drones) per episode
     avg_fire_distances = [[], []]  # Track average distance to fire per episode
 
     # NOTE: agents will be created per-scenario so each scenario trains its own policy
@@ -1346,7 +1692,7 @@ def main():
     # Open and write headers
     training_fp = open(training_csv_path, 'w', newline='')
     training_writer = csv.writer(training_fp)
-    training_writer.writerow(["episode", "total_reward", "length", "success", "collisions", "avg_goal_dist", "crash_types", "proximity_component", "exploration_component", "energy_component", "fires_discovered", "normalized_total", "norm_prox_mean", "norm_expl_mean", "norm_energy_mean", "action_saturation_fraction", "actor_loss", "critic_loss", "td_error"])
+    training_writer.writerow(["episode", "total_reward", "length", "success", "collisions", "avg_goal_dist", "crash_types", "proximity_component", "exploration_component", "energy_component", "fires_discovered", "normalized_total", "norm_prox_mean", "norm_expl_mean", "norm_energy_mean", "action_saturation_fraction", "actor_loss", "actor_loss_raw", "actor_q_mean", "target_q_mean", "critic_loss", "td_error", "fires_viewed", "boxes_explored"])
 
     steps_fp = open(steps_csv_path, 'w', newline='')
     steps_writer = csv.writer(steps_fp)
@@ -1375,6 +1721,60 @@ def main():
     else:
         print("Training will start from scratch.")
 
+    # Allow user to configure which reward components are active (useful for ablation studies)
+    # Present a numbered menu to make automated entry easier.
+    comp_list = [
+        ('proximity', 'Proximity rewards & penalties'),
+        ('exploration', 'Exploration cell rewards'),
+        ('energy', 'Per-step energy penalty'),
+        ('edge', 'Edge/wall penalty'),
+        ('movement', 'Movement bonus'),
+        ('stationary_penalty', 'Penalty for being nearly stationary'),
+        ('discovery', 'Fire discovery bonus'),
+        ('lateral', 'Lateral/patrol bonus'),
+        ('optimal', 'Optimal proximity small bonus'),
+        ('cell_regen', 'Cell reward regeneration'),
+    ]
+    print("Reward component toggles (enter numbers to ENABLE):")
+    for idx, (_, desc) in enumerate(comp_list, start=1):
+        key = comp_list[idx-1][0]
+        print(f"  {idx}: {desc} (key='{key}', default={'ON' if REWARD_COMPONENTS.get(key, True) else 'OFF'})")
+    print("Commands: blank=use defaults, 'all' = enable all, 'none' = disable all")
+    rc_input = input("Enter numbers to ENABLE (comma-separated, ranges OK e.g. 1,3-5): ").strip().lower()
+    if rc_input == '':
+        # keep defaults
+        pass
+    elif rc_input == 'all':
+        for k in REWARD_COMPONENTS:
+            REWARD_COMPONENTS[k] = True
+    elif rc_input == 'none':
+        for k in REWARD_COMPONENTS:
+            REWARD_COMPONENTS[k] = False
+    else:
+        chosen = set()
+        parts = [p.strip() for p in rc_input.split(',') if p.strip()]
+        for p in parts:
+            if '-' in p:
+                try:
+                    a, b = p.split('-', 1)
+                    a_i = int(a); b_i = int(b)
+                    for n in range(min(a_i, b_i), max(a_i, b_i)+1):
+                        if 1 <= n <= len(comp_list):
+                            chosen.add(comp_list[n-1][0])
+                except Exception:
+                    pass
+            else:
+                try:
+                    n = int(p)
+                    if 1 <= n <= len(comp_list):
+                        chosen.add(comp_list[n-1][0])
+                except Exception:
+                    pass
+        # enable chosen, disable the rest
+        for k in REWARD_COMPONENTS:
+            REWARD_COMPONENTS[k] = (k in chosen)
+    print(f"Using reward components: {REWARD_COMPONENTS}")
+
     for scenario_idx, scenario in enumerate(scenarios):
         print(f"\n=== SCENARIO {scenario}: {scenario_names[scenario]} ===")
         last_episode_states = None
@@ -1402,13 +1802,13 @@ def main():
             loaded_any = False
             for i in range(len(agents)):
                 fname = f"td3_agent_s{scenario}_agent_{i}.pkl"
-                try:
-                    if os.path.exists(fname):
+                if os.path.exists(fname):
+                    if hasattr(agents[i], 'load') and callable(getattr(agents[i], 'load')):
                         agents[i].load(fname)
                         loaded_any = True
                         print(f"Loaded existing agent file {fname} for scenario {scenario}, agent {i}")
-                except Exception:
-                    print(f"Failed to load {fname} for scenario {scenario}, agent {i}")
+                    else:
+                        print(f"Agent {i} has no callable 'load' method; cannot load {fname}")
             if not loaded_any:
                 print("No scenario-specific agent files found. Training will start from scratch for this scenario.")
         # Each scenario is divided into two sections as requested. Sections 1 and 2
@@ -1420,9 +1820,10 @@ def main():
             sections = [1]
             print("[INFO] Running training scenario (section 1). Section 2 will be skipped.")
         # Informative summary: how many episodes will be executed for this scenario
-        try:
+        # Compute total planned episodes defensively
+        if isinstance(curriculum_episodes, (int, np.integer)) and curriculum_episodes >= 1:
             total_planned = len(sections) * 5 * int(curriculum_episodes)
-        except Exception:
+        else:
             total_planned = None
         if total_planned is not None:
             print(f"Planned episodes for scenario {scenario}: {total_planned} (sections={sections}, curriculum_levels=5, episodes_per_level={curriculum_episodes})")
@@ -1525,111 +1926,133 @@ def main():
                         # default safety - keep reset positions
                         pass
                     # refresh observation to match overridden drone positions / fires
-                    try:
+                    if hasattr(env, '_get_obs') and callable(getattr(env, '_get_obs')):
                         obs = env._get_obs()
-                    except Exception:
-                        obs, _ = env.reset()
-                # Ensure per-episode discovery tracking is reset
-                try:
-                    env.fires_visited = [set() for _ in range(env.n_drones)]
-                except Exception:
-                    # Fallback: attach attribute if missing
-                    env.fires_visited = [set() for _ in range(env.n_drones)]
-                done = [False, False]
-                total_reward = [0, 0]
-                fire_distances = [[], []]  # Track fire distances during episode
-                steps = 0
-                crash_type = [None, None]  # Track crash reason for each drone
-
-                # Track seen areas for each drone (list of (x, y, radius))
-                seen_areas = [[], []]
-                # Track seen grid cells for exploration reward
-                seen_grids = [set(), set()]
-
-                # --- Store episode-level and step-level data for logging/visualization ---
-                episode_states = []
-                episode_fire_centers = []
-                episode_rewards_per_step = []
-                episode_dones_per_step = []
-                episode_actions = []
-                rewards = [0, 0]  # Initialize rewards before first step
-
-                while not all(done) and steps < steps_per_episode:
-                    actions = np.zeros((env.n_drones, 3))
-                    for i in range(env.n_drones):
-                        if not done[i]:
-                            # During warmup choose random actions to fill buffer
-                            if global_step < start_timesteps:
-                                actions[i] = np.random.uniform(-1, 1, size=(3,))
-                            else:
-                                actions[i] = agents[i].select_action(obs[i])
-
-                    # Store action and state before step for logging/visualization
-                    episode_actions.append(np.copy(actions))
-                    episode_states.append(np.copy(obs[:, :3]))
-
-                    next_obs, rewards, done, _, info = env.step(actions, seen_grids=seen_grids)
-
-                    # Store post-step info
-                    if env.scenario == 2:
-                        episode_fire_centers.append([fc.copy() for fc in env.fire_centers])
                     else:
-                        episode_fire_centers.append(None)
-                    episode_rewards_per_step.append(list(rewards))
-                    episode_dones_per_step.append(list(done))
+                        obs, _ = env.reset()
+                    # Ensure per-episode discovery tracking is reset
+                    if hasattr(env, 'n_drones'):
+                        env.fires_visited = [set() for _ in range(env.n_drones)]
+                    else:
+                        env.fires_visited = [set() for _ in range(2)]
+                    done = [False, False]
+                    total_reward = [0, 0]
+                    fire_distances = [[], []]  # Track fire distances during episode
+                    steps = 0
+                    crash_type = [None, None]  # Track crash reason for each drone
 
-                    # Track fire distances
-                    def point_to_segment_dist(p, a, b):
-                        ap = p - a
-                        ab = b - a
-                        t = np.dot(ap, ab) / (np.dot(ab, ab) + 1e-8)
-                        t = np.clip(t, 0, 1)
-                        closest = a + t * ab
-                        return np.linalg.norm(p - closest)
+                    # Track seen areas for each drone (list of (x, y, radius))
+                    seen_areas = [[], []]
+                    # Track seen grid cells for exploration reward
+                    seen_grids = [set(), set()]
 
-                    for i in range(env.n_drones):
-                        if not done[i]:
-                            if env.scenario == 2:
-                                # Closest fire center (defensive: handle empty fire list)
-                                if not getattr(env, 'fire_centers', None):
-                                    dist_to_fire = float('inf')
+                    # --- Store episode-level and step-level data for logging/visualization ---
+                    episode_states = []
+                    episode_fire_centers = []
+                    episode_rewards_per_step = []
+                    episode_dones_per_step = []
+                    episode_actions = []
+                    rewards = [0, 0]  # Initialize rewards before first step
+
+                    while not all(done) and steps < steps_per_episode:
+                        actions = np.zeros((env.n_drones, 3))
+                        for i in range(env.n_drones):
+                            if not done[i]:
+                                # During warmup choose random actions to fill buffer
+                                if global_step < start_timesteps:
+                                    actions[i] = np.random.uniform(-1, 1, size=(3,))
                                 else:
-                                    dists = [np.linalg.norm(next_obs[i][:3] - fc) for fc in env.fire_centers]
-                                    dist_to_fire = min(dists) if dists else float('inf')
+                                    actions[i] = agents[i].select_action(obs[i])
+
+                        # Store action and state before step for logging/visualization
+                        episode_actions.append(np.copy(actions))
+                        episode_states.append(np.copy(obs[:, :3]))
+
+                        next_obs, rewards, done, _, info = env.step(actions, seen_grids=seen_grids)
+
+                        # Store post-step info
+                        if env.scenario == 2:
+                            episode_fire_centers.append([fc.copy() for fc in env.fire_centers])
+                        else:
+                            episode_fire_centers.append(None)
+                        episode_rewards_per_step.append(list(rewards))
+                        episode_dones_per_step.append(list(done))
+
+                        # Track fire distances
+                        def point_to_segment_dist(p, a, b):
+                            ap = p - a
+                            ab = b - a
+                            t = np.dot(ap, ab) / (np.dot(ab, ab) + 1e-8)
+                            t = np.clip(t, 0, 1)
+                            closest = a + t * ab
+                            return np.linalg.norm(p - closest)
+
+                        for i in range(env.n_drones):
+                            if not done[i]:
+                                if env.scenario == 2:
+                                    # Closest fire center (defensive: handle empty fire list)
+                                    if not getattr(env, 'fire_centers', None):
+                                        dist_to_fire = float('inf')
+                                    else:
+                                        dists = [np.linalg.norm(next_obs[i][:3] - fc) for fc in env.fire_centers]
+                                        dist_to_fire = min(dists) if dists else float('inf')
+                                else:
+                                    dist_to_fire = point_to_segment_dist(next_obs[i][:3], env.fire_line[0], env.fire_line[1])
+                                fire_distances[i].append(dist_to_fire)
+
+                        # Record seen area for each drone
+                        k = 1.0  # must match _get_obs and render
+                        for i in range(env.n_drones):
+                            pos = next_obs[i]
+                            drone_xy = np.array([pos[0], pos[1]])
+                            z = pos[2]
+                            view_radius = k * z / 8
+                            seen_areas[i].append((drone_xy[0], drone_xy[1], view_radius))
+
+                        for i in range(env.n_drones):
+                            # Clamp raw reward and pass clipped raw reward to agent (agent will normalize)
+                            raw_r = float(rewards[i])
+                            r_clamped = float(np.clip(raw_r, -REWARD_CLIP, REWARD_CLIP))
+                            r_for_buffer = r_clamped * reward_scale
+                            # Update per-component normalizer if env returned breakdown
+                            # Extract component contributions defensively
+                            if isinstance(info, dict):
+                                # Defensive extraction of per-drone components
+                                prox_list = info.get('proximity_contrib', None)
+                                if isinstance(prox_list, (list, tuple)) and len(prox_list) > i:
+                                    try:
+                                        prox_val = float(prox_list[i])
+                                    except Exception:
+                                        prox_val = float('nan')
+                                else:
+                                    prox_val = float('nan')
+
+                                expl_list = info.get('exploration_contrib', None)
+                                if isinstance(expl_list, (list, tuple)) and len(expl_list) > i:
+                                    try:
+                                        expl_val = float(expl_list[i])
+                                    except Exception:
+                                        expl_val = float('nan')
+                                else:
+                                    expl_val = float('nan')
+
+                                energy_list = info.get('energy', None)
+                                if isinstance(energy_list, (list, tuple)) and len(energy_list) > i:
+                                    try:
+                                        energy_val = float(energy_list[i])
+                                    except Exception:
+                                        energy_val = float('nan')
+                                else:
+                                    energy_val = float('nan')
                             else:
-                                dist_to_fire = point_to_segment_dist(next_obs[i][:3], env.fire_line[0], env.fire_line[1])
-                            fire_distances[i].append(dist_to_fire)
-
-                    # Record seen area for each drone
-                    k = 1.0  # must match _get_obs and render
-                    for i in range(env.n_drones):
-                        pos = next_obs[i]
-                        drone_xy = np.array([pos[0], pos[1]])
-                        z = pos[2]
-                        view_radius = k * z / 8
-                        seen_areas[i].append((drone_xy[0], drone_xy[1], view_radius))
-
-                    for i in range(env.n_drones):
-                        # Clamp raw reward and pass clipped raw reward to agent (agent will normalize)
-                        raw_r = float(rewards[i])
-                        r_clamped = float(np.clip(raw_r, -REWARD_CLIP, REWARD_CLIP))
-                        r_for_buffer = r_clamped * reward_scale
-                        # Update per-component normalizer if env returned breakdown
-                        try:
-                            prox_val = float(info.get('proximity_contrib', [float('nan')])[i]) if info is not None else float('nan')
-                            expl_val = float(info.get('exploration_contrib', [float('nan')])[i]) if info is not None else float('nan')
-                            energy_val = float(info.get('energy', [float('nan')])[i]) if info is not None else float('nan')
-                        except Exception:
-                            prox_val = expl_val = energy_val = float('nan')
-                        # Update running stats
-                        try:
-                            reward_normalizer.update(prox_val, expl_val, energy_val)
-                        except Exception:
-                            pass
-                        # If the per-component normalizer is ready, use normalized components to form a scaled reward for buffer
-                        normalized_total = None
-                        exploration_norm = proximity_norm = energy_norm = float('nan')
-                        try:
+                                prox_val = expl_val = energy_val = float('nan')
+                            # Update running stats
+                            # Update running stats if normalizer is available
+                            if hasattr(reward_normalizer, 'update') and callable(getattr(reward_normalizer, 'update')):
+                                reward_normalizer.update(prox_val, expl_val, energy_val)
+                            # If the per-component normalizer is ready, use normalized components to form a scaled reward for buffer
+                            normalized_total = None
+                            exploration_norm = proximity_norm = energy_norm = float('nan')
                             if reward_normalizer.ready():
                                 p_n, e_n, en_n = reward_normalizer.normalize(prox_val, expl_val, energy_val)
                                 # Keep consistent naming: prox, expl, energy
@@ -1642,382 +2065,380 @@ def main():
                                 normalized_total = PROX_WEIGHT * proximity_norm + EXPL_WEIGHT * exploration_norm - ENERGY_WEIGHT * energy_norm + shaped_goal_bonus
                                 # Clip normalized total to avoid extreme values
                                 normalized_total = float(np.clip(normalized_total, -float(NORMALIZED_REWARD_CLIP), float(NORMALIZED_REWARD_CLIP)))
-                        except Exception:
-                            normalized_total = None
 
-                        # Decide what to store in buffer: prefer normalized_total when available, else raw clipped reward
-                        if normalized_total is not None:
-                            r_buffer = float(normalized_total)
-                        else:
-                            r_buffer = r_for_buffer
+                            # Decide what to store in buffer: prefer normalized_total when available, else raw clipped reward
+                            if normalized_total is not None:
+                                r_buffer = float(normalized_total)
+                            else:
+                                r_buffer = r_for_buffer
 
-                        # Store the reward used for training in the agent's buffer
-                        agents[i].store(obs[i], actions[i], r_buffer, next_obs[i], float(done[i]))
-                        # Attempt a training step; agent.train() will gate on warmup internally
-                        agents[i].train()
-                        # Write per-update diagnostics if the agent produced them
-                        try:
-                            updates_writer.writerow([
-                                global_episode_counter,
-                                steps,
-                                i,
-                                agents[i].total_it,
-                                getattr(agents[i], 'last_actor_loss', float('nan')),
-                                getattr(agents[i], 'last_critic_loss', float('nan')),
-                                getattr(agents[i], 'last_td_error', float('nan')),
-                                getattr(agents[i], 'last_q_min', float('nan')),
-                                getattr(agents[i], 'last_q_max', float('nan')),
-                                getattr(agents[i], 'last_normalized_reward', float('nan')),
-                                getattr(agents[i], 'last_actor_grad_norm', float('nan')),
-                                getattr(agents[i], 'last_critic_grad_norm', float('nan')),
-                                getattr(agents[i].buffer, 'ptr', float('nan'))
-                            ])
-                            try:
-                                updates_fp.flush()
-                            except Exception:
-                                pass
-                        except Exception:
-                            pass
-                        # Use the clamped raw reward for human-readable episode totals, but also track normalized totals
-                        total_reward[i] += r_clamped
-                        if normalized_total is not None:
-                            # track a separate normalized episode total (create attribute if needed)
-                            if not hasattr(agents[i], 'episode_normalized_total'):
-                                agents[i].episode_normalized_total = 0.0
-                            agents[i].episode_normalized_total += float(normalized_total)
-                        # store per-step normalized comps for later CSV logging
-                        try:
+                            # Store the reward used for training in the agent's buffer
+                            agents[i].store(obs[i], actions[i], r_buffer, next_obs[i], float(done[i]))
+                            # Attempt a training step; agent.train() will gate on warmup internally
+                            agents[i].train()
+                            # Write per-update diagnostics if the agent produced them
+                            # Write update diagnostics if writer is available
+                            if 'updates_writer' in locals() and updates_writer is not None:
+                                updates_writer.writerow([
+                                    global_episode_counter,
+                                    steps,
+                                    i,
+                                    agents[i].total_it,
+                                    getattr(agents[i], 'last_actor_loss', float('nan')),
+                                    getattr(agents[i], 'last_critic_loss', float('nan')),
+                                    getattr(agents[i], 'last_td_error', float('nan')),
+                                    getattr(agents[i], 'last_q_min', float('nan')),
+                                    getattr(agents[i], 'last_q_max', float('nan')),
+                                    getattr(agents[i], 'last_normalized_reward', float('nan')),
+                                    getattr(agents[i], 'last_actor_grad_norm', float('nan')),
+                                    getattr(agents[i], 'last_critic_grad_norm', float('nan')),
+                                    getattr(agents[i].buffer, 'ptr', float('nan'))
+                                ])
+                                if 'updates_fp' in locals() and hasattr(updates_fp, 'flush') and not getattr(updates_fp, 'closed', False):
+                                    updates_fp.flush()
+                            # Use the clamped raw reward for human-readable episode totals, but also track normalized totals
+                            total_reward[i] += r_clamped
+                            if normalized_total is not None:
+                                # track a separate normalized episode total (create attribute if needed)
+                                if not hasattr(agents[i], 'episode_normalized_total'):
+                                    agents[i].episode_normalized_total = 0.0
+                                agents[i].episode_normalized_total += float(normalized_total)
+                            # store per-step normalized comps for later CSV logging
                             if 'episode_normalized_components' not in locals():
                                 episode_normalized_components = [[] for _ in range(env.n_drones)]
-                        except Exception:
-                            episode_normalized_components = [[] for _ in range(env.n_drones)]
-                        try:
                             # Clip per-step normalized_total to avoid extreme artifacts
-                            try:
-                                clipped_norm_total = float(np.clip(normalized_total, -float(NORMALIZED_REWARD_CLIP), float(NORMALIZED_REWARD_CLIP))) if normalized_total is not None else float('nan')
-                            except Exception:
+                            if normalized_total is not None:
+                                clipped_norm_total = float(np.clip(normalized_total, -float(NORMALIZED_REWARD_CLIP), float(NORMALIZED_REWARD_CLIP)))
+                            else:
                                 clipped_norm_total = float('nan')
                             episode_normalized_components[i].append((exploration_norm, proximity_norm, energy_norm, clipped_norm_total))
-                        except Exception:
-                            episode_normalized_components[i].append((float('nan'), float('nan'), float('nan'), float('nan')))
-                        # If env provided component breakdown in info, record for logging
-                        try:
+                            # If env provided component breakdown in info, record for logging
                             # info may contain 'exploration_contrib', 'proximity_contrib', and 'energy'
                             if isinstance(info, dict):
-                                if 'exploration_contrib' in info:
-                                    # per-drone contributions list
-                                    exploration_val = float(info['exploration_contrib'][i]) if len(info['exploration_contrib']) > i else float('nan')
-                                else:
-                                    exploration_val = float('nan')
-                                if 'proximity_contrib' in info:
-                                    proximity_val = float(info['proximity_contrib'][i]) if len(info['proximity_contrib']) > i else float('nan')
-                                else:
-                                    proximity_val = float('nan')
-                                if 'energy' in info:
-                                    energy_val = float(info['energy'][i]) if len(info['energy']) > i else float('nan')
-                                else:
-                                    energy_val = float('nan')
+                                exploration_val = float('nan')
+                                proximity_val = float('nan')
+                                energy_val = float('nan')
+                                expl_list = info.get('exploration_contrib', None)
+                                if isinstance(expl_list, (list, tuple)) and len(expl_list) > i:
+                                    try:
+                                        exploration_val = float(expl_list[i])
+                                    except Exception:
+                                        exploration_val = float('nan')
+                                prox_list = info.get('proximity_contrib', None)
+                                if isinstance(prox_list, (list, tuple)) and len(prox_list) > i:
+                                    try:
+                                        proximity_val = float(prox_list[i])
+                                    except Exception:
+                                        proximity_val = float('nan')
+                                en_list = info.get('energy', None)
+                                if isinstance(en_list, (list, tuple)) and len(en_list) > i:
+                                    try:
+                                        energy_val = float(en_list[i])
+                                    except Exception:
+                                        energy_val = float('nan')
                             else:
                                 exploration_val = proximity_val = energy_val = float('nan')
-                        except Exception:
-                            exploration_val = proximity_val = energy_val = float('nan')
-                        # Detect crash type with clearer messages
-                        if done[i] and crash_type[i] is None:
-                            if env.scenario == 5:
-                                if rewards[i] <= COLLISION_PENALTY:
-                                    # Check if random crash or wall
-                                    prev_x = obs[i][0]
-                                    new_x = next_obs[i][0]
-                                    wall_x = env.fire_wall_x
-                                    # If drone is on opposite side of wall after step, it's a wall crash
-                                    if (prev_x < wall_x and new_x >= wall_x) or (prev_x > wall_x and new_x <= wall_x):
-                                        crash_type[i] = 'crashed into fire wall (x={:.2f})'.format(wall_x)
-                                    else:
-                                        crash_type[i] = 'random ground crash (1% chance)'
-                            else:
-                                if rewards[i] <= COLLISION_PENALTY:
-                                    # Check if crashed into fire or other drone
-                                    if done[0] and done[1] and np.linalg.norm(next_obs[0][:3] - next_obs[1][:3]) < 2*env.drone_radius + env.safety_margin + 1e-3:
-                                        crash_type[0] = crash_type[1] = 'drone-drone collision'
-                                    else:
-                                        crash_type[i] = 'fire collision'
-
-                    obs = next_obs
-                    steps += 1
-                    global_step += 1
-
-                    # Process any scheduled spawns for scenario 2 (timed deterministic fire spawns)
-                    try:
-                        if hasattr(env, '_scheduled_spawns') and env._scheduled_spawns:
-                            # env._scheduled_spawns is list of (spawn_step, np.array([x,y,z]))
-                            remaining = []
-                            for spawn_step, spawn_pt in env._scheduled_spawns:
-                                if steps >= spawn_step:
-                                    # Only add if not too close to any drone start/position
-                                    if all(np.linalg.norm(spawn_pt - dp) > 1.0 for dp in env.drone_pos):
-                                        env.fire_centers.append(spawn_pt)
+                            # Detect crash type with clearer messages
+                            if done[i] and crash_type[i] is None:
+                                if env.scenario == 5:
+                                    if rewards[i] <= COLLISION_PENALTY:
+                                        # Check if random crash or wall
+                                        prev_x = obs[i][0]
+                                        new_x = next_obs[i][0]
+                                        wall_x = env.fire_wall_x
+                                        # If drone is on opposite side of wall after step, it's a wall crash
+                                        if (prev_x < wall_x and new_x >= wall_x) or (prev_x > wall_x and new_x <= wall_x):
+                                            crash_type[i] = 'crashed into fire wall (x={:.2f})'.format(wall_x)
+                                        else:
+                                            crash_type[i] = 'random ground crash (1% chance)'
                                 else:
-                                    remaining.append((spawn_step, spawn_pt))
-                            env._scheduled_spawns = remaining
-                    except Exception:
-                        pass
+                                    if rewards[i] <= COLLISION_PENALTY:
+                                        # Check if crashed into fire or other drone
+                                        if done[0] and done[1] and np.linalg.norm(next_obs[0][:3] - next_obs[1][:3]) < 2*env.drone_radius + env.safety_margin + 1e-3:
+                                            crash_type[0] = crash_type[1] = 'drone-drone collision'
+                                        else:
+                                            crash_type[i] = 'fire collision'
 
-                    # For scenario 2, section 2: spawn a random fire every 30 steps (not on drone positions)
-                    try:
-                        if scenario == 2 and 'section' in locals() and section == 2:
-                            # Only spawn if we have fewer than 7 fires
-                            if steps > 0 and steps % 30 == 0 and len(getattr(env, 'fire_centers', [])) < 7:
-                                tries = 0
-                                while tries < 50:
-                                    tries += 1
-                                    x = np.random.uniform(1, env.area_size-1)
-                                    y = np.random.uniform(1, env.area_size-1)
-                                    z = np.random.uniform(5, 10)
-                                    pt = np.array([x, y, z])
-                                    # ensure spawn not on any drone
-                                    if all(np.linalg.norm(pt - dp) > 1.0 for dp in env.drone_pos):
-                                        env.fire_centers.append(pt)
-                                        break
-                    except Exception:
-                        pass
+                        obs = next_obs
+                        steps += 1
+                        global_step += 1
 
-                # Save last episode's states for visualization
-                if curriculum_level == 4 and episode == curriculum_episodes - 1:
-                    last_episode_states = episode_states
-                    last_episode_fire_centers = episode_fire_centers
 
-                # Calculate average fire distances for this episode
-                for i in range(env.n_drones):
-                    if crash_type[i] is None and done[i]:
-                        crash_type[i] = 'timeout'
-                    episode_rewards[i].append(total_reward[i])
-                    if fire_distances[i]:
-                        avg_fire_distances[i].append(np.mean(fire_distances[i]))
-                    else:
-                        avg_fire_distances[i].append(float('inf'))  # No distance recorded
 
-                # Episode number for this scenario/curriculum
-                scenario_episode = curriculum_level * curriculum_episodes + episode + 1
-                # Increment global episode counter and log
-                global_episode_counter += 1
+                    # Save last episode's states for visualization
+                    if curriculum_level == 4 and episode == curriculum_episodes - 1:
+                        last_episode_states = episode_states
+                        last_episode_fire_centers = episode_fire_centers
 
-                # Periodic deterministic evaluation (every 5 episodes)
-                if global_episode_counter % 5 == 0:
-                    # Run a single deterministic episode for agents and log
-                    eval_env = DroneEnv(curriculum_level=curriculum_level, scenario=scenario)
-                    eval_obs, _ = eval_env.reset()
-                    eval_done = [False, False]
-                    eval_steps = 0
-                    eval_total = [0.0, 0.0]
-                    while not all(eval_done) and eval_steps < 300:
-                        eval_actions = np.zeros((eval_env.n_drones, 3))
-                        for ai in range(eval_env.n_drones):
-                            if not eval_done[ai]:
-                                eval_actions[ai] = agents[ai].select_action(eval_obs[ai], deterministic=True)
-                        eval_next_obs, eval_rewards, eval_done, _, _ = eval_env.step(eval_actions)
-                        for ai in range(eval_env.n_drones):
-                            eval_total[ai] += float(np.clip(eval_rewards[ai], -REWARD_CLIP, REWARD_CLIP))
-                        eval_obs = eval_next_obs
-                        eval_steps += 1
-                    # Write eval metrics
-                    eval_path = logs_dir / "eval_metrics.csv"
-                    write_header = not eval_path.exists()
-                    with open(eval_path, 'a', newline='') as efp:
-                        ew = csv.writer(efp)
-                        if write_header:
-                            ew.writerow(["episode", "scenario", "curriculum_level", "eval_steps", "eval_total_reward", "eval_avg_reward", "eval_success"])
-                        ev_success = 1 if sum(1 for r in eval_total if r > COLLISION_PENALTY) == eval_env.n_drones else 0
-                        ew.writerow([global_episode_counter, scenario, curriculum_level, eval_steps, float(np.mean(eval_total)), float(np.mean(eval_total)), ev_success])
+                    # Calculate average fire distances for this episode
+                    for i in range(env.n_drones):
+                        if crash_type[i] is None and done[i]:
+                            crash_type[i] = 'timeout'
+                        episode_rewards[i].append(total_reward[i])
+                        if fire_distances[i]:
+                            avg_fire_distances[i].append(np.mean(fire_distances[i]))
+                        else:
+                            avg_fire_distances[i].append(float('inf'))  # No distance recorded
 
-                # Determine success & collisions heuristically. Use crash_type where available.
-                collisions = 0
-                for i in range(env.n_drones):
-                    ct = crash_type[i]
-                    if ct is not None and ('collision' in ct or 'crash' in ct or 'fire' in ct or 'wall' in (ct or '')):
-                        collisions += 1
-                    else:
-                        # Fallback: if total_reward very low below collision penalty, count as collision
-                        if total_reward[i] <= COLLISION_PENALTY:
+                    # Episode number for this scenario/curriculum
+                    scenario_episode = curriculum_level * curriculum_episodes + episode + 1
+                    # Increment global episode counter and log
+                    global_episode_counter += 1
+
+                    # Periodic deterministic evaluation (every 5 episodes)
+                    if global_episode_counter % 5 == 0:
+                        # Run a single deterministic episode for agents and log
+                        eval_env = DroneEnv(curriculum_level=curriculum_level, scenario=scenario)
+                        eval_obs, _ = eval_env.reset()
+                        eval_done = [False, False]
+                        eval_steps = 0
+                        eval_total = [0.0, 0.0]
+                        while not all(eval_done) and eval_steps < 300:
+                            eval_actions = np.zeros((eval_env.n_drones, 3))
+                            for ai in range(eval_env.n_drones):
+                                if not eval_done[ai]:
+                                    eval_actions[ai] = agents[ai].select_action(eval_obs[ai], deterministic=True)
+                            eval_next_obs, eval_rewards, eval_done, _, _ = eval_env.step(eval_actions)
+                            for ai in range(eval_env.n_drones):
+                                eval_total[ai] += float(np.clip(eval_rewards[ai], -REWARD_CLIP, REWARD_CLIP))
+                            eval_obs = eval_next_obs
+                            eval_steps += 1
+                        # Write eval metrics
+                        eval_path = logs_dir / "eval_metrics.csv"
+                        write_header = not eval_path.exists()
+                        with open(eval_path, 'a', newline='') as efp:
+                            ew = csv.writer(efp)
+                            if write_header:
+                                ew.writerow(["episode", "scenario", "curriculum_level", "eval_steps", "eval_total_reward", "eval_avg_reward", "eval_success"])
+                            ev_success = 1 if sum(1 for r in eval_total if r > COLLISION_PENALTY) == eval_env.n_drones else 0
+                            ew.writerow([global_episode_counter, scenario, curriculum_level, eval_steps, float(np.mean(eval_total)), float(np.mean(eval_total)), ev_success])
+
+                    # Determine success & collisions heuristically. Use crash_type where available.
+                    collisions = 0
+                    for i in range(env.n_drones):
+                        ct = crash_type[i]
+                        if ct is not None and ('collision' in ct or 'crash' in ct or 'fire' in ct or 'wall' in (ct or '')):
                             collisions += 1
-                success = 1 if collisions == 0 else 0
-                # Average goal distance (use avg_fire_distances if available)
-                try:
-                    vals = [fire_distances[i][-1] if fire_distances[i] else np.nan for i in range(env.n_drones)]
-                    # If all entries are NaN or list empty, avoid nanmean to prevent runtime warnings
+                        else:
+                            # Fallback: if total_reward very low below collision penalty, count as collision
+                            if total_reward[i] <= COLLISION_PENALTY:
+                                collisions += 1
+                    success = 1 if collisions == 0 else 0
+                    # Average goal distance (use avg_fire_distances if available)
+                    # Compute average goal distance defensively
+                    vals = [fire_distances[i][-1] if fire_distances[i] else np.nan for i in range(getattr(env, 'n_drones', 2))]
                     if len(vals) == 0 or all(np.isnan(vals)):
                         avg_goal_dist = float('nan')
                     else:
                         avg_goal_dist = float(np.nanmean(vals))
-                except Exception:
-                    avg_goal_dist = float('nan')
 
-                # If the episode ended due to timeout, apply the timeout penalty once to the total reward
-                for i in range(env.n_drones):
-                    if crash_type[i] == 'timeout':
-                        # Subtract timeout penalty once (timeouts are less severe than collisions)
-                        episode_rewards[i] = [r for r in episode_rewards[i]]
-                        total_reward[i] += TIMEOUT_PENALTY
+                    # If the episode ended due to timeout, apply the timeout penalty once to the total reward
+                    for i in range(env.n_drones):
+                        if crash_type[i] == 'timeout':
+                            # Subtract timeout penalty once (timeouts are less severe than collisions)
+                            episode_rewards[i] = [r for r in episode_rewards[i]]
+                            total_reward[i] += TIMEOUT_PENALTY
 
-                # Include last actor/critic/td diagnostics if available
-                actor_loss_log = float('nan')
-                critic_loss_log = float('nan')
-                td_error_log = float('nan')
-                try:
-                    # Use agent 0 diagnostics as representative
-                    actor_loss_log = agents[0].last_actor_loss if hasattr(agents[0], 'last_actor_loss') else float('nan')
-                    critic_loss_log = agents[0].last_critic_loss if hasattr(agents[0], 'last_critic_loss') else float('nan')
-                    td_error_log = agents[0].last_td_error if hasattr(agents[0], 'last_td_error') else float('nan')
-                except Exception:
-                    pass
+                    # Include last actor/critic/td diagnostics if available
+                    actor_loss_log = float('nan')
+                    critic_loss_log = float('nan')
+                    td_error_log = float('nan')
+                    # Use agent 0 diagnostics as representative if available
+                    if agents and len(agents) > 0:
+                        # For human-friendly plotting we store a positive magnitude for actor loss
+                        # (many monitoring tools expect higher => worse). Keep the raw objective
+                        # in `actor_loss_raw` for debugging, but here write abs(raw).
+                        a_raw = getattr(agents[0], 'last_actor_loss_raw', float('nan'))
+                        if not (isinstance(a_raw, float) and (a_raw != a_raw)):
+                            try:
+                                # a_raw can be positive or negative depending on Q sign; use abs()
+                                actor_loss_log = float(abs(a_raw))
+                            except Exception:
+                                actor_loss_log = float('nan')
+                        else:
+                            # Fallback to agent's last_actor_loss (already may be signed); take abs
+                            try:
+                                actor_loss_log = float(abs(getattr(agents[0], 'last_actor_loss', float('nan'))))
+                            except Exception:
+                                actor_loss_log = float('nan')
+                        critic_loss_log = agents[0].last_critic_loss if hasattr(agents[0], 'last_critic_loss') else float('nan')
+                        td_error_log = agents[0].last_td_error if hasattr(agents[0], 'last_td_error') else float('nan')
 
-                # Aggregate last-step approximate components for logging (best-effort)
-                prox_comp = float(np.nan)
-                expl_comp = float(np.nan)
-                try:
-                    # If we recorded proximity/exploration contributions per step in env info, use last
-                    last_info = None
-                    # Some code paths append per-step info to episode_rewards_per_step as tuples
-                    if episode_rewards_per_step and isinstance(episode_rewards_per_step[-1][0], (list, tuple)):
-                        prox_comp = float(episode_rewards_per_step[-1][0][0])
-                        expl_comp = float(episode_rewards_per_step[-1][0][1])
-                except Exception:
-                    pass
-                # Energy component: best-effort extract from last info stored in episode arrays if available
-                energy_comp = float(np.nan)
-                try:
-                    if episode_rewards_per_step and len(episode_rewards_per_step[-1]) >= 3:
-                        # If last entry contains breakdown (prox, expl, energy), try to use it
+                    # Aggregate last-step approximate components for logging (best-effort)
+                    prox_comp = float(np.nan)
+                    expl_comp = float(np.nan)
+                    # If we recorded proximity/exploration contributions per step in env info, extract them
+                    if episode_rewards_per_step and isinstance(episode_rewards_per_step[-1][0], (list, tuple)) and len(episode_rewards_per_step[-1][0]) >= 2:
+                        try:
+                            prox_comp = safe_float(episode_rewards_per_step[-1][0][0])
+                        except Exception:
+                            prox_comp = float('nan')
+                        try:
+                            expl_comp = safe_float(episode_rewards_per_step[-1][0][1])
+                        except Exception:
+                            expl_comp = float('nan')
+                    # Energy component: best-effort extract from last info stored in episode arrays if available
+                    energy_comp = float(np.nan)
+                    # Extract energy component if available
+                    if episode_rewards_per_step and len(episode_rewards_per_step[-1]) >= 1:
                         last_entry = episode_rewards_per_step[-1][0]
                         if isinstance(last_entry, (list, tuple)) and len(last_entry) >= 3:
-                            energy_comp = float(last_entry[2])
-                except Exception:
-                    energy_comp = float('nan')
+                            try:
+                                energy_comp = float(last_entry[2])
+                            except Exception:
+                                energy_comp = float('nan')
 
-                # Aggregate normalized components per episode if available
-                try:
-                    norm_prox_sum = float('nan')
-                    norm_expl_sum = float('nan')
-                    norm_energy_sum = float('nan')
-                    norm_total = float('nan')
+                    # Aggregate normalized components per episode if available
+                    # Aggregate normalized components per episode if available
+                    norm_prox_sum = norm_expl_sum = norm_energy_sum = norm_total = float('nan')
                     if 'episode_normalized_components' in locals():
-                        # Sum across steps for drone 0 only (consistent with other per-step logging)
                         vals = episode_normalized_components[0]
                         if vals:
                             arr = np.array(vals, dtype=np.float32)
-                            # columns: exploration_norm, proximity_norm, energy_norm, normalized_total
-                            norm_expl_sum = float(np.nansum(arr[:, 0]))
-                            norm_prox_sum = float(np.nansum(arr[:, 1]))
-                            norm_energy_sum = float(np.nansum(arr[:, 2]))
-                            norm_total = float(np.nansum(arr[:, 3]))
-                except Exception:
-                    norm_prox_sum = norm_expl_sum = norm_energy_sum = norm_total = float('nan')
+                            if arr.size > 0 and arr.shape[1] >= 4:
+                                norm_expl_sum = float(np.nansum(arr[:, 0]))
+                                norm_prox_sum = float(np.nansum(arr[:, 1]))
+                                norm_energy_sum = float(np.nansum(arr[:, 2]))
+                                norm_total = float(np.nansum(arr[:, 3]))
+                            else:
+                                norm_expl_sum = norm_prox_sum = norm_energy_sum = norm_total = float('nan')
 
-                # Compute per-episode action saturation fraction (fraction of steps where any action dim is near ±1)
-                try:
+                    # Compute per-episode action saturation fraction (fraction of steps where any action dim is near ±1)
+                    # Compute per-episode action saturation fraction defensively
                     sats = []
                     for t in range(len(episode_actions)):
                         act = episode_actions[t][0] if t < len(episode_actions) else np.array([0.0, 0.0, 0.0])
-                        sats.append(float(np.mean(np.abs(act) > 0.98)))
+                        try:
+                            a_arr = np.asarray(act)
+                            if a_arr.size == 0:
+                                sats.append(float('nan'))
+                            else:
+                                sats.append(float(np.mean(np.abs(a_arr) > 0.98)))
+                        except Exception:
+                            sats.append(float('nan'))
                     action_saturation_fraction = float(np.nanmean(sats)) if sats else float('nan')
-                except Exception:
-                    action_saturation_fraction = float('nan')
 
-                # Compute mean normalized components over episode for drone 0
-                try:
-                    norm_prox_mean = float('nan')
-                    norm_expl_mean = float('nan')
-                    norm_energy_mean = float('nan')
+                    # Compute mean normalized components over episode for drone 0
+                    # Compute mean normalized components over episode for drone 0
+                    norm_prox_mean = norm_expl_mean = norm_energy_mean = float('nan')
                     if 'episode_normalized_components' in locals():
                         vals = episode_normalized_components[0]
                         if vals:
                             arr = np.array(vals, dtype=np.float32)
-                            # Guard against empty or all-NaN columns to avoid runtime warnings
                             if arr.size == 0 or np.all(np.isnan(arr)):
                                 norm_expl_mean = norm_prox_mean = norm_energy_mean = float('nan')
                             else:
-                                norm_expl_mean = float(np.nanmean(arr[:, 0])) if not np.all(np.isnan(arr[:, 0])) else float('nan')
-                                norm_prox_mean = float(np.nanmean(arr[:, 1])) if not np.all(np.isnan(arr[:, 1])) else float('nan')
-                                norm_energy_mean = float(np.nanmean(arr[:, 2])) if not np.all(np.isnan(arr[:, 2])) else float('nan')
-                except Exception:
-                    norm_prox_mean = norm_expl_mean = norm_energy_mean = float('nan')
+                                if arr.shape[1] >= 3:
+                                    norm_expl_mean = float(np.nanmean(arr[:, 0])) if not np.all(np.isnan(arr[:, 0])) else float('nan')
+                                    norm_prox_mean = float(np.nanmean(arr[:, 1])) if not np.all(np.isnan(arr[:, 1])) else float('nan')
+                                    norm_energy_mean = float(np.nanmean(arr[:, 2])) if not np.all(np.isnan(arr[:, 2])) else float('nan')
+                                else:
+                                    norm_expl_mean = norm_prox_mean = norm_energy_mean = float('nan')
 
-                # Count fires discovered this episode (drone 0 used as representative; sum unique discoveries across drones)
-                try:
-                    fires_discovered = sum(len(s) for s in getattr(env, 'fires_visited', [set() for _ in range(env.n_drones)]))
-                except Exception:
-                    fires_discovered = 0
-                # Safely compute mean total_reward (avoid warnings on empty lists)
-                mean_total = float(np.mean(total_reward)) if total_reward else float('nan')
-                training_writer.writerow([global_episode_counter, mean_total, int(steps), success, int(collisions), float(avg_goal_dist), ";".join([str(ct) for ct in crash_type]), prox_comp, expl_comp, energy_comp, int(fires_discovered), norm_total, norm_prox_mean, norm_expl_mean, norm_energy_mean, action_saturation_fraction, actor_loss_log, critic_loss_log, td_error_log])
-
-                # Write per-step rows (log only drone 0 for compactness)
-                # When writing per-step rows, attempt to split reward into components if possible.
-                for t in range(len(episode_states)):
-                    st = episode_states[t][0]
-                    act = episode_actions[t][0] if t < len(episode_actions) else np.array([0.0, 0.0, 0.0])
-                    reward_step = episode_rewards_per_step[t][0] if t < len(episode_rewards_per_step) else 0.0
-                    # Try to estimate exploration vs proximity component if we recorded seen grids or computed them
-                    exploration_comp = float('nan')
-                    proximity_comp = float('nan')
-                    # If env provided a breakdown in episode_rewards_per_step as tuples, handle that
-                    try:
-                        # Some code paths may have stored a tuple (prox, expl)
-                        if isinstance(episode_rewards_per_step[t][0], (list, tuple)) and len(episode_rewards_per_step[t][0]) >= 2:
-                            proximity_comp = float(episode_rewards_per_step[t][0][0])
-                            exploration_comp = float(episode_rewards_per_step[t][0][1])
-                    except Exception:
-                        pass
-
-                    # As a safety, clamp the recorded per-step reward to a reasonable range to avoid huge episode sums
-                    reward_step_clamped = float(np.clip(reward_step, -REWARD_CLIP, REWARD_CLIP))
-                    # Fill td_error column from agent diagnostics if available (use agent 0 as representative)
-                    td_error_val = float('nan')
-                    try:
-                        td_error_val = agents[0].last_td_error if hasattr(agents[0], 'last_td_error') else float('nan')
-                    except Exception:
-                        td_error_val = float('nan')
-                    # extract per-step energy component if env provided it in episode arrays (info not stored per-step by default)
-                    energy_val = float('nan')
-                    try:
-                        # if episode_rewards_per_step stored tuples (prox, expl) or info was preserved, try to extract energy
-                        if t < len(episode_rewards_per_step):
-                            # attempt to read from episode_rewards_per_step's associated info if available
-                            # otherwise, fallback to NaN
-                            pass
-                        # compute action_saturation metric for this step (fraction of action dims near ±1)
-                        action_saturation = float(np.mean(np.abs(act) > 0.98))
-                    except Exception:
-                        action_saturation = float('nan')
-                    # Pull per-step normalized components if available
-                    expl_norm = prox_norm = energy_norm = norm_reward_step = float('nan')
-                    try:
-                        if 'episode_normalized_components' in locals() and t < len(episode_normalized_components[0]):
-                            en = episode_normalized_components[0][t]
-                            expl_norm = float(en[0])
-                            prox_norm = float(en[1])
-                            energy_norm = float(en[2])
-                            norm_reward_step = float(en[3])
-                    except Exception:
-                        expl_norm = prox_norm = energy_norm = norm_reward_step = float('nan')
-
-                    steps_writer.writerow([global_episode_counter, t, float(st[0]), float(st[1]), float(st[2]), float(act[0]), float(act[1]), float(act[2]), reward_step_clamped, exploration_comp, proximity_comp, energy_val, expl_norm, prox_norm, energy_norm, norm_reward_step, td_error_val, action_saturation, 0])
-
-                # Human-friendly episode summary
-                end_msgs = []
-                for i in range(env.n_drones):
-                    if crash_type[i] is None:
-                        end_reason = 'completed'
+                    # Count fires discovered this episode (drone 0 used as representative; sum unique discoveries across drones)
+                    # Count fires discovered this episode defensively
+                    fv = getattr(env, 'fires_visited', None)
+                    if fv is None:
+                        fires_discovered = 0
                     else:
-                        end_reason = crash_type[i]
-                    avg_dist = avg_fire_distances[i][-1] if avg_fire_distances[i] else float('inf')
-                    end_msgs.append(f"Drone {i+1}: Total Points = {total_reward[i]:.1f}, Avg Fire Distance = {avg_dist:.2f}, Ended by: {end_reason}")
-                print(f"Episode {scenario_episode}/{5 * curriculum_episodes} (Scenario {scenario}, Level {curriculum_level+1}) Total Rewards: {[round(r, 1) for r in total_reward]}")
-                for m in end_msgs:
-                    print('  ' + m)
+                        try:
+                            fires_discovered = sum(len(s) for s in fv)
+                        except Exception:
+                            fires_discovered = 0
+                    # Record per-episode fires viewed
+                    try:
+                        episode_fires_viewed.append(int(fires_discovered))
+                    except Exception:
+                        episode_fires_viewed.append(0)
+                    # Record number of unique grid cells explored this episode (union across drones)
+                    try:
+                        # seen_grids is a list of sets updated during step()
+                        if isinstance(seen_grids, (list, tuple)):
+                            union_cells = set()
+                            for s in seen_grids:
+                                try:
+                                    union_cells.update(s)
+                                except Exception:
+                                    pass
+                            episode_boxes_explored.append(int(len(union_cells)))
+                        else:
+                            episode_boxes_explored.append(0)
+                    except Exception:
+                        episode_boxes_explored.append(0)
+                    # Safely compute mean total_reward (avoid warnings on empty lists)
+                    mean_total = float(np.mean(total_reward)) if total_reward else float('nan')
+                    # Include additional actor/critic diagnostics for debugging actor loss
+                    actor_loss_raw_log = float(getattr(agents[0], 'last_actor_loss_raw', float('nan'))) if agents and len(agents) > 0 else float('nan')
+                    actor_q_mean_log = float(getattr(agents[0], 'last_actor_q_mean', float('nan'))) if agents and len(agents) > 0 else float('nan')
+                    target_q_mean_log = float(getattr(agents[0], 'last_target_q_mean', float('nan'))) if agents and len(agents) > 0 else float('nan')
+                    training_writer.writerow([global_episode_counter, mean_total, int(steps), success, int(collisions), float(avg_goal_dist), ";".join([str(ct) for ct in crash_type]), prox_comp, expl_comp, energy_comp, int(fires_discovered), norm_total, norm_prox_mean, norm_expl_mean, norm_energy_mean, action_saturation_fraction, actor_loss_log, actor_loss_raw_log, actor_q_mean_log, target_q_mean_log, critic_loss_log, td_error_log, int(episode_fires_viewed[-1]) if episode_fires_viewed else 0, int(episode_boxes_explored[-1]) if episode_boxes_explored else 0])
 
-                # Decay noise for all agents after each episode
-                for agent in agents:
-                    agent.decay_noise()
+                    # Write per-step rows (log only drone 0 for compactness)
+                    # When writing per-step rows, attempt to split reward into components if possible.
+                    for t in range(len(episode_states)):
+                        st = episode_states[t][0]
+                        act = episode_actions[t][0] if t < len(episode_actions) else np.array([0.0, 0.0, 0.0])
+                        reward_step = episode_rewards_per_step[t][0] if t < len(episode_rewards_per_step) else 0.0
+                        # Try to estimate exploration vs proximity component if we recorded seen grids or computed them
+                        exploration_comp = float('nan')
+                        proximity_comp = float('nan')
+                        # If env provided a breakdown in episode_rewards_per_step as tuples, handle that
+                        # Some code paths may have stored a tuple (prox, expl)
+                        if t < len(episode_rewards_per_step) and isinstance(episode_rewards_per_step[t][0], (list, tuple)) and len(episode_rewards_per_step[t][0]) >= 2:
+                            try:
+                                proximity_comp = float(episode_rewards_per_step[t][0][0])
+                            except Exception:
+                                proximity_comp = float('nan')
+                            try:
+                                exploration_comp = float(episode_rewards_per_step[t][0][1])
+                            except Exception:
+                                exploration_comp = float('nan')
+
+                        # As a safety, clamp the recorded per-step reward to a reasonable range to avoid huge episode sums
+                        reward_step_clamped = float(np.clip(reward_step, -REWARD_CLIP, REWARD_CLIP))
+                        # Fill td_error column from agent diagnostics if available (use agent 0 as representative)
+                        td_error_val = float('nan')
+                        if agents and len(agents) > 0:
+                            td_error_val = agents[0].last_td_error if hasattr(agents[0], 'last_td_error') else float('nan')
+                        else:
+                            td_error_val = float('nan')
+                        # extract per-step energy component if env provided it in episode arrays (info not stored per-step by default)
+                        energy_val = float('nan')
+                        # compute action_saturation metric for this step (fraction of action dims near ±1)
+                        try:
+                            action_saturation = float(np.mean(np.abs(np.asarray(act)) > 0.98))
+                        except Exception:
+                            action_saturation = float('nan')
+                        # Pull per-step normalized components if available
+                        expl_norm = prox_norm = energy_norm = norm_reward_step = float('nan')
+                        if 'episode_normalized_components' in locals() and t < len(episode_normalized_components[0]):
+                            try:
+                                en = episode_normalized_components[0][t]
+                                expl_norm = float(en[0])
+                                prox_norm = float(en[1])
+                                energy_norm = float(en[2])
+                                norm_reward_step = float(en[3])
+                            except Exception:
+                                expl_norm = prox_norm = energy_norm = norm_reward_step = float('nan')
+
+                        steps_writer.writerow([global_episode_counter, t, float(st[0]), float(st[1]), float(st[2]), float(act[0]), float(act[1]), float(act[2]), reward_step_clamped, exploration_comp, proximity_comp, energy_val, expl_norm, prox_norm, energy_norm, norm_reward_step, td_error_val, action_saturation, 0])
+
+                    # Human-friendly episode summary
+                    end_msgs = []
+                    for i in range(env.n_drones):
+                        if crash_type[i] is None:
+                            end_reason = 'completed'
+                        else:
+                            end_reason = crash_type[i]
+                        avg_dist = avg_fire_distances[i][-1] if avg_fire_distances[i] else float('inf')
+                        end_msgs.append(f"Drone {i+1}: Total Points = {total_reward[i]:.1f}, Avg Fire Distance = {avg_dist:.2f}, Ended by: {end_reason}")
+                    print(f"Episode {scenario_episode}/{5 * curriculum_episodes} (Scenario {scenario}, Level {curriculum_level+1}) Total Rewards: {[round(r, 1) for r in total_reward]}")
+                    for m in end_msgs:
+                        print('  ' + m)
+
+                    # Decay noise for all agents after each episode
+                    for agent in agents:
+                        agent.decay_noise()
 
         # --- Play episode visualization after scenario ends (auto-play; no prompt) ---
         is_last_scenario = (scenario_idx == len(scenarios) - 1)
@@ -2036,7 +2457,7 @@ def main():
                 try:
                     if not mid_frame_saved and t >= len(last_episode_states)//2:
                         fname = plots_dir / f'visualization_step_{t}.png'
-                        plt.savefig(fname, dpi=150)
+                        plt.savefig(fname, dpi=1000)
                         print(f"Saved visualization frame to {fname}")
                         mid_frame_saved = True
                 except Exception:
@@ -2096,6 +2517,197 @@ def main():
     plt.title('Total Points per Episode')
     plt.legend()
     plt.grid(True, alpha=0.3)
+
+    # Helper: compute averages over the last `percent` portion of episodes
+    def compute_last_percent_stats(episode_rewards_list, fires_viewed_list, boxes_explored_list, percent=0.10):
+        """
+        episode_rewards_list: list of two lists [[drone0_eps...], [drone1_eps...]] or single list
+        fires_viewed_list: list of ints (total fires viewed per episode)
+        boxes_explored_list: list of ints (unique grid cells explored per episode)
+        percent: fraction of total episodes to consider (default 0.10 = last 10%)
+
+        Returns dict with per-drone and overall averages for points, fires, boxes, and counts used.
+        """
+        # Normalize inputs
+        if isinstance(episode_rewards_list, list) and len(episode_rewards_list) == 2:
+            eps0 = list(episode_rewards_list[0])
+            eps1 = list(episode_rewards_list[1])
+        else:
+            eps0 = list(episode_rewards_list)
+            eps1 = []
+        n = max(len(eps0), len(eps1))
+        if n == 0:
+            return {'count': 0, 'avg_points_drone0': float('nan'), 'avg_points_drone1': float('nan'), 'avg_points_overall': float('nan'), 'avg_fires_viewed': float('nan'), 'avg_boxes_explored': float('nan')}
+        last_n = max(1, int(max(1, n * percent)))
+        # slice last_n from each
+        tail0 = eps0[-last_n:] if eps0 else []
+        tail1 = eps1[-last_n:] if eps1 else []
+        # compute averages defensively
+        def safe_mean(arr):
+            try:
+                if not arr:
+                    return float('nan')
+                return float(np.nanmean(np.array(arr, dtype=np.float64)))
+            except Exception:
+                return float('nan')
+        avg0 = safe_mean(tail0)
+        avg1 = safe_mean(tail1)
+        # overall: average of available drone averages (prefer both if available)
+        if not np.isnan(avg0) and not np.isnan(avg1):
+            avg_overall = float((avg0 + avg1) / 2.0)
+        elif not np.isnan(avg0):
+            avg_overall = avg0
+        elif not np.isnan(avg1):
+            avg_overall = avg1
+        else:
+            avg_overall = float('nan')
+        # fires and boxes lists length may be shorter/longer; use tail of same last_n episodes if possible
+        fv_tail = fires_viewed_list[-last_n:] if fires_viewed_list else []
+        be_tail = boxes_explored_list[-last_n:] if boxes_explored_list else []
+        avg_fv = safe_mean(fv_tail)
+        avg_be = safe_mean(be_tail)
+        return {'count': last_n, 'avg_points_drone0': avg0, 'avg_points_drone1': avg1, 'avg_points_overall': avg_overall, 'avg_fires_viewed': avg_fv, 'avg_boxes_explored': avg_be}
+
+    # Print summary for last 10% of episodes if we collected data
+    try:
+        stats = compute_last_percent_stats(episode_rewards, episode_fires_viewed, episode_boxes_explored, percent=0.10)
+        if stats.get('count', 0) > 0:
+            print(f"Summary over last {stats['count']} episodes ({max(1,int(len(episode_rewards[0])*0.1))}):")
+            print(f"  Avg points (drone0) = {stats['avg_points_drone0']:.2f}, (drone1) = {stats['avg_points_drone1']:.2f}, overall = {stats['avg_points_overall']:.2f}")
+            print(f"  Avg fires viewed per episode = {stats['avg_fires_viewed']:.2f}")
+            print(f"  Avg boxes explored per episode = {stats['avg_boxes_explored']:.2f}")
+    except Exception:
+        pass
+
+    # Offer to generate an analysis plot from the recorded training CSV log
+    try:
+        gen_plot = input("Generate analysis plot from recorded log? (y/n): ").strip().lower()
+    except Exception:
+        gen_plot = 'n'
+    if gen_plot == 'y':
+        try:
+            log_path = logs_dir / "training_metrics.csv"
+            out_dir = Path('plots')
+            out_dir.mkdir(exist_ok=True)
+            out_path = out_dir / 'analysis_ablation.png'
+            # Try to use pandas if available (convenient), else fall back to csv + numpy
+            try:
+                import pandas as _pd
+                df = _pd.read_csv(log_path)
+            except Exception:
+                import csv as _csv
+                rows = []
+                with open(log_path, 'r', newline='') as _f:
+                    rdr = _csv.DictReader(_f)
+                    for r in rdr:
+                        rows.append(r)
+                if not rows:
+                    print(f"No rows found in {log_path}")
+                    df = None
+                else:
+                    # Build minimal dataframe-like dict
+                    import numpy as _np
+                    cols = rows[0].keys()
+                    data = {c: [] for c in cols}
+                    for r in rows:
+                        for c in cols:
+                            data[c].append(r[c])
+                    # convert to pandas if available
+                    try:
+                        import pandas as _pd
+                        df = _pd.DataFrame(data)
+                    except Exception:
+                        # Minimal object with column access via dict
+                        df = data
+            if df is None:
+                print("Could not load training log for plotting.")
+            else:
+                # Ensure numeric conversion where possible
+                def to_float_col(d, key):
+                    try:
+                        return _pd.to_numeric(d[key], errors='coerce')
+                    except Exception:
+                        try:
+                            return _np.array([float(x) if x is not None and x != '' else _np.nan for x in d[key]], dtype=float)
+                        except Exception:
+                            return None
+                try:
+                    import numpy as _np
+                    if hasattr(df, 'to_numpy'):
+                        ep = to_float_col(df, 'episode') if 'episode' in df.columns else None
+                        tr = to_float_col(df, 'total_reward') if 'total_reward' in df.columns else None
+                        fv = to_float_col(df, 'fires_viewed') if 'fires_viewed' in df.columns else None
+                        be = to_float_col(df, 'boxes_explored') if 'boxes_explored' in df.columns else None
+                    else:
+                        ep = to_float_col(df, 'episode') if 'episode' in df else None
+                        tr = to_float_col(df, 'total_reward') if 'total_reward' in df else None
+                        fv = to_float_col(df, 'fires_viewed') if 'fires_viewed' in df else None
+                        be = to_float_col(df, 'boxes_explored') if 'boxes_explored' in df else None
+                except Exception:
+                    ep = tr = fv = be = None
+
+                import matplotlib.pyplot as _plt
+                _plt.figure(figsize=(10, 6))
+                ax1 = _plt.gca()
+                plotted = False
+                if tr is not None:
+                    try:
+                        x = _np.arange(len(tr))
+                        _plt.plot(x, tr, color='C0', alpha=0.6, label='Total Reward')
+                        # rolling mean
+                        try:
+                            window = max(1, int(len(tr) * 0.05))
+                            roll = _pd.Series(tr).rolling(window, min_periods=1).mean()
+                            _plt.plot(x, roll, color='C1', label=f'Rolling({window}) Reward')
+                        except Exception:
+                            pass
+                        plotted = True
+                    except Exception:
+                        pass
+                if fv is not None or be is not None:
+                    ax2 = ax1.twinx()
+                    if fv is not None:
+                        try:
+                            ax2.plot(_np.arange(len(fv)), fv, color='C2', alpha=0.6, label='Fires Viewed')
+                        except Exception:
+                            pass
+                    if be is not None:
+                        try:
+                            ax2.plot(_np.arange(len(be)), be, color='C3', alpha=0.6, label='Boxes Explored')
+                        except Exception:
+                            pass
+                    ax2.set_ylabel('Counts')
+                if plotted:
+                    _plt.title('Training metrics: Reward and Exploration')
+                    _plt.xlabel('Episode')
+                    _plt.legend(loc='upper left')
+                try:
+                    _plt.savefig(out_path, dpi=200)
+                    print(f"Saved analysis plot to {out_path}")
+                except Exception:
+                    print("Failed to save analysis plot")
+                # Print console summary from CSV (mean and last-10%)
+                try:
+                    tot = tr if tr is not None else []
+                    fv_arr = fv if fv is not None else []
+                    be_arr = be if be is not None else []
+                    def arr_mean(a):
+                        try:
+                            return float(_np.nanmean(_np.array(a, dtype=float)))
+                        except Exception:
+                            return float('nan')
+                    overall_mean = arr_mean(tot)
+                    n = len(tot)
+                    last_k = max(1, int(max(1, n * 0.1)))
+                    last_mean = arr_mean(tot[-last_k:]) if n > 0 else float('nan')
+                    fv_last = arr_mean(fv_arr[-last_k:]) if len(fv_arr) >= 1 else float('nan')
+                    be_last = arr_mean(be_arr[-last_k:]) if len(be_arr) >= 1 else float('nan')
+                    print(f"CSV summary: episodes={n}, overall mean reward={overall_mean:.2f}, mean last {last_k}={last_mean:.2f}")
+                    print(f"CSV summary: avg fires viewed last {last_k} = {fv_last:.2f}, avg boxes explored last {last_k} = {be_last:.2f}")
+                except Exception:
+                    pass
+        except Exception as e:
+            print("Failed to generate analysis plot:", e)
     
     # Subplot 2: Average fire distances
     plt.subplot(1, 3, 2)
@@ -2143,11 +2755,11 @@ def main():
     plots_dir = Path('plots')
     plots_dir.mkdir(exist_ok=True)
     stats_fname = plots_dir / 'stats_summary.png'
-    try:
+    if hasattr(plt, 'savefig'):
         plt.tight_layout()
-        plt.savefig(stats_fname, dpi=200)
+        plt.savefig(stats_fname, dpi=500)
         print(f"Saved stats summary to {stats_fname}")
-    except Exception:
+    else:
         plt.show()
 
     # Plot union of all seen areas for each drone (last episode)
@@ -2171,15 +2783,16 @@ def main():
     plt.ylabel('Y')
     plt.legend()
     # Save union plot
-    try:
+    if hasattr(plt, 'savefig'):
         union_fname = plots_dir / 'union_seen_areas.png'
-        plt.savefig(union_fname, dpi=200)
+        plt.savefig(union_fname, dpi=500)
         print(f"Saved union of seen areas to {union_fname}")
-    except Exception:
+    else:
         plt.show()
 
     # --- Plot Exploration Reward Table (cell_rewards) ---
-    try:
+    # --- Plot Exploration Reward Table (cell_rewards) ---
+    if hasattr(plt, 'savefig') and hasattr(env, 'cell_rewards'):
         fig_exp = plt.figure(figsize=(6, 5))
         ax_exp = fig_exp.add_subplot(111)
         # Use actual min/max of the cell rewards to utilize full colormap range
@@ -2196,10 +2809,10 @@ def main():
         fig_exp.colorbar(im, ax=ax_exp, label='Cell Reward Value')
         fig_exp.tight_layout()
         exp_fname = plots_dir / 'exploration_reward_table.png'
-        fig_exp.savefig(exp_fname, dpi=200)
+        fig_exp.savefig(exp_fname, dpi=500)
         plt.close(fig_exp)
         print(f"Saved exploration reward table to {exp_fname}")
-    except Exception:
+    else:
         plt.show()
 
     # --- Integrated Reward System Heatmap (for last episode) ---
@@ -2265,7 +2878,8 @@ def main():
             # Total
             integrated_reward[gx, gy] = fire_reward - edge_penalty + exploration_reward
     # Use actual min/max for integrated reward heatmap to show full range
-    try:
+    # Save integrated reward heatmap if matplotlib saving is available
+    if hasattr(plt, 'savefig'):
         int_vmin = float(np.nanmin(integrated_reward))
         int_vmax = float(np.nanmax(integrated_reward))
         if int_vmin == int_vmax:
@@ -2280,10 +2894,10 @@ def main():
         fig_int.colorbar(im2, ax=ax_int, label='Total Reward Value')
         fig_int.tight_layout()
         int_fname = plots_dir / 'integrated_reward_heatmap.png'
-        fig_int.savefig(int_fname, dpi=200)
+        fig_int.savefig(int_fname, dpi=500)
         plt.close(fig_int)
         print(f"Saved integrated reward heatmap to {int_fname}")
-    except Exception:
+    else:
         plt.show()
 
     # --- Save trained agents ---
@@ -2308,12 +2922,21 @@ def main():
                     if obs_len > 3:
                         obs[3] = 0.0
                 # deterministic actor
-                try:
+                # Evaluate actor only if available
+                if hasattr(agent, 'actor') and callable(getattr(agent, 'actor')):
                     with torch.no_grad():
-                        act = agent.actor(torch.tensor(obs, dtype=torch.float32).unsqueeze(0)).cpu().numpy()[0]
-                    grid[ix, iy] = act
-                except Exception as e:
-                    print(f"Failed to evaluate actor for obs len={obs_len}: {e}")
+                        try:
+                            out = agent.actor(torch.tensor(obs, dtype=torch.float32).unsqueeze(0))
+                            if isinstance(out, torch.Tensor):
+                                act = out.cpu().numpy()[0]
+                            else:
+                                act = np.asarray(out)[0]
+                            grid[ix, iy] = act
+                        except Exception as e:
+                            # Print once per failure but continue filling grid with zeros
+                            print(f"Failed to evaluate actor for obs len={obs_len}: {e}")
+                            grid[ix, iy] = np.zeros(env.action_space.shape[1], dtype=np.float32)
+                else:
                     grid[ix, iy] = np.zeros(env.action_space.shape[1], dtype=np.float32)
         # Save grid and axes for plotting
         np.save(fname, {'xs': xs, 'ys': ys, 'grid': grid})
@@ -2321,26 +2944,29 @@ def main():
 
     # Non-interactive auto-save when running in SMOKE_RUN mode
     smoke_env = os.environ.get('SMOKE_RUN', '0')
-    try:
+    if isinstance(smoke_env, str) and smoke_env.lstrip('+-').isdigit():
         smoke_episodes = int(smoke_env)
-    except Exception:
+    else:
         smoke_episodes = 0
+    # Track whether any agents were saved during this run (to decide whether to offer plotting)
+    saved_any = False
     if smoke_episodes > 0:
         # Auto-save agent 0 to a deterministic filename for later inspection
-        try:
-            # If an existing file is present, back it up first
-            dst = f'td3_agent_s{scenario}_agent_0.pkl'
-            if os.path.exists(dst):
-                bak = dst + '.bak'
+        # Auto-save agent 0 to a deterministic filename for later inspection
+        dst = f'td3_agent_s{scenario}_agent_0.pkl'
+        if os.path.exists(dst):
+            bak = dst + '.bak'
+            # Backup if possible
+            if hasattr(shutil, 'copyfile'):
                 try:
                     shutil.copyfile(dst, bak)
                     print(f"Backed up existing '{dst}' to '{bak}'")
-                except Exception:
-                    pass
-            agents[0].save(dst)
-            print(f"Auto-saved agent 0 to '{dst}' (SMOKE_RUN mode)")
-        except Exception as e:
-            print("Failed to auto-save agent in SMOKE_RUN mode:", e)
+                except Exception as e:
+                    # Non-fatal: report and continue to overwrite
+                    print(f"Warning: failed to backup existing '{dst}' to '{bak}': {e}")
+        agents[0].save(dst)
+        saved_any = True
+        print(f"Auto-saved agent 0 to '{dst}' (SMOKE_RUN mode)")
     else:
         save_input = input(f"Save trained agents to file? (y/n): ").strip().lower()
         if save_input == 'y':
@@ -2352,30 +2978,34 @@ def main():
                         print(f"Skipping save for agent {i}.")
                         continue
                 agent.save(fname)
+                saved_any = True
                 print(f"Saved agent {i} to '{fname}'.")
                 # Export decision map for agent 0 only (helpful for plotting)
                 if i == 0:
-                    try:
-                        export_decision_map(agent, env)
-                    except Exception as e:
-                        print("Failed to export decision map:", e)
+                    export_decision_map(agent, env)
 
     # Close log files if open
-    try:
+    # Close log files if open
+    if 'training_fp' in locals() and not training_fp.closed:
         training_fp.close()
+    if 'steps_fp' in locals() and not steps_fp.closed:
         steps_fp.close()
-    except Exception:
-        pass
 
-    # Offer to generate analysis plots now
-    plot_now = input("Generate analysis plots now from recorded logs? (y/n): ").strip().lower()
-    if plot_now == 'y':
-        try:
-            # Call the analysis plotting script
-            import runpy
-            runpy.run_path("analysis/plot_all_figures.py", run_name="__main__")
-        except Exception as e:
-            print("Failed to run plotting script:", e)
+    # Offer to generate analysis plots now, but only once and only if we saved any agents
+    # (skip prompting during non-interactive SMOKE_RUNs)
+    if smoke_episodes == 0 and saved_any:
+        plot_now = input("Generate analysis plots now from recorded logs? (y/n): ").strip().lower()
+        if plot_now == 'y':
+            # Call the analysis plotting script only if it exists
+            plot_script = Path("analysis/plot_all_figures.py")
+            if plot_script.exists():
+                import runpy
+                try:
+                    runpy.run_path(str(plot_script), run_name="__main__")
+                except Exception as e:
+                    print("Failed to run plotting script:", e)
+            else:
+                print("Plotting script not found at analysis/plot_all_figures.py")
 
 if __name__ == "__main__":
     import os
