@@ -1625,42 +1625,53 @@ def main():
     scenario_names = {1: "Static Fire Line", 2: "Spreading Fire", 3: "Line of Fires", 4: "Random Fires", 5: "Impassable Fire Wall (w/ Random Crash)", 6: "Central Fire"}
     all_scenarios = sorted(list(scenario_names.keys()))
 
+    # First question: ask whether to run an automated ablation study
+    try:
+        ablation_mode = input("Run in ablation mode (automated ablation sweep)? (y/n): ").strip().lower()
+    except Exception:
+        ablation_mode = 'n'
+
     # The training script no longer runs the final test scenario.
     # Final/test runs should be executed using `final_environment.py` (standalone runner).
     run_test_only = False
 
-    print("Available scenarios (choose one):")
-    for s in all_scenarios:
-        print(f"  {s}: {scenario_names[s]}")
-    user_input = input("Enter a single scenario number to run (e.g., 1): ").strip()
-    # Validate numeric input explicitly
-    if isinstance(user_input, str) and user_input.lstrip('+-').isdigit():
-        scenario_choice = int(user_input)
-        if scenario_choice in all_scenarios:
-            scenarios = [scenario_choice]
+    if ablation_mode != 'y':
+        print("Available scenarios (choose one):")
+        for s in all_scenarios:
+            print(f"  {s}: {scenario_names[s]}")
+        user_input = input("Enter a single scenario number to run (e.g., 1): ").strip()
+        # Validate numeric input explicitly
+        if isinstance(user_input, str) and user_input.lstrip('+-').isdigit():
+            scenario_choice = int(user_input)
+            if scenario_choice in all_scenarios:
+                scenarios = [scenario_choice]
+            else:
+                print("Invalid scenario selected. Defaulting to scenario 1.")
+                scenarios = [all_scenarios[0]]
         else:
-            print("Invalid scenario selected. Defaulting to scenario 1.")
+            print("No valid input. Defaulting to scenario 1.")
             scenarios = [all_scenarios[0]]
-    else:
-        print("No valid input. Defaulting to scenario 1.")
-        scenarios = [all_scenarios[0]]
 
     # Ask user for configurable run parameters
     # Require a non-empty integer for curriculum_episodes. Loop until valid input provided.
-    while True:
-        raw = input("Enter number of episodes per curriculum level (e.g. 1). This many episodes will run before moving to the next level: ").strip()
-        if raw == '':
-            print("Please enter a number (example: 30). This is the number of episodes per curriculum level.")
-            continue
-        if isinstance(raw, str) and raw.lstrip('+-').isdigit():
-            curriculum_episodes = int(raw)
-            if curriculum_episodes < 1:
-                print("Please enter an integer >= 1.")
+    if ablation_mode != 'y':
+        while True:
+            raw = input("Enter number of episodes per curriculum level (e.g. 1). This many episodes will run before moving to the next level: ").strip()
+            if raw == '':
+                print("Please enter a number (example: 30). This is the number of episodes per curriculum level.")
                 continue
-            break
-        else:
-            print("Invalid input. Please type an integer (e.g. 30).")
-            continue
+            if isinstance(raw, str) and raw.lstrip('+-').isdigit():
+                curriculum_episodes = int(raw)
+                if curriculum_episodes < 1:
+                    print("Please enter an integer >= 1.")
+                    continue
+                break
+            else:
+                print("Invalid input. Please type an integer (e.g. 30).")
+                continue
+    else:
+        # In ablation mode the number of episodes-per-mode is asked later; set a safe default
+        curriculum_episodes = 1
 
     raw_steps = input("Enter maximum steps per episode (e.g. 300): ").strip()
     if isinstance(raw_steps, str) and raw_steps.lstrip('+-').isdigit():
@@ -1669,6 +1680,273 @@ def main():
             steps_per_episode = 300
     else:
         steps_per_episode = 300
+    # Ask if user wants to run an automated ablation sweep (use earlier answer if prompted first)
+    if 'ablation_mode' not in locals():
+        try:
+            ablation_mode = input("Run in ablation mode (automated ablation sweep)? (y/n): ").strip().lower()
+        except Exception:
+            ablation_mode = 'n'
+    if ablation_mode == 'y':
+        # Choose scenario for ablation (single scenario)
+        print("Available scenarios for ablation:")
+        for s in all_scenarios:
+            print(f"  {s}: {scenario_names[s]}")
+        sc_in = input("Enter scenario number to run ablation on (e.g. 1): ").strip()
+        if isinstance(sc_in, str) and sc_in.lstrip('+-').isdigit():
+            sc_choice = int(sc_in)
+            if sc_choice in all_scenarios:
+                ablation_scenario = sc_choice
+            else:
+                print("Invalid scenario; defaulting to scenario 1")
+                ablation_scenario = all_scenarios[0]
+        else:
+            ablation_scenario = all_scenarios[0]
+        # Number of episodes to run per ablation mode
+        while True:
+            eps_in = input("Enter number of episodes to run PER ablation mode (integer >=1): ").strip()
+            if isinstance(eps_in, str) and eps_in.lstrip('+-').isdigit():
+                episodes_per_mode = int(eps_in)
+                if episodes_per_mode >= 1:
+                    break
+            print("Please enter a valid integer >= 1.")
+
+        # Build modes: baseline (all on) then for each component disable it (single-component ablation)
+        try:
+            comp_keys = [c[0] for c in comp_list]
+        except Exception:
+            comp_keys = list(REWARD_COMPONENTS.keys())
+        modes = []
+        # Baseline
+        modes.append(("baseline_all_on", {k: True for k in REWARD_COMPONENTS}))
+        for k in comp_keys:
+            cfg = {kk: True for kk in REWARD_COMPONENTS}
+            if k in cfg:
+                cfg[k] = False
+            modes.append((f"no_{k}", cfg))
+
+        print(f"Running ablation sweep on scenario {ablation_scenario} with {episodes_per_mode} episodes per mode")
+        # Prepare results container
+        ablation_results = []  # list of dicts: {mode, avg_reward, avg_fires_viewed, avg_boxes_explored}
+        plots_dir = Path('plots')
+        plots_dir.mkdir(exist_ok=True)
+
+        # Iterate modes and run a simplified training loop per mode (fresh agents per mode)
+        for mode_name, comp_cfg in modes:
+            print(f"\n=== Ablation mode: {mode_name} ===")
+            # Apply component configuration
+            for kk in REWARD_COMPONENTS:
+                REWARD_COMPONENTS[kk] = bool(comp_cfg.get(kk, True))
+            print(f"Using components: {REWARD_COMPONENTS}")
+
+            # Create environment and agents fresh for this mode
+            env = DroneEnv(curriculum_level=0, scenario=ablation_scenario)
+            obs, _ = env.reset()
+            agents = [TD3Agent(env.area_size, env.drone_radius, env.fire_line, env.fire_radius, env.safety_margin, env.max_step_size, obs_dim=env.observation_space.shape[1], act_dim=env.action_space.shape[1]) for _ in range(env.n_drones)]
+
+            # Per-episode accumulators
+            mode_episode_rewards = []
+            mode_episode_fires = []
+            mode_episode_boxes = []
+
+            # Run episodes for this mode (agents will train during runs)
+            # Keep curriculum levels and sections as in the main training loop
+            sections = [2] if run_test_only else [1]
+            for section in sections:
+                # 5 curriculum levels per scenario
+                for curriculum_level in range(5):
+                    print(f"  --- Ablation mode {mode_name}: SECTION {section} - CURRICULUM LEVEL {curriculum_level + 1}/5 ---")
+                    # create env for this curriculum level
+                    env = DroneEnv(curriculum_level=curriculum_level, scenario=ablation_scenario)
+                    # run episodes_per_mode episodes at this curriculum level
+                    for ep in range(episodes_per_mode):
+                        obs, _ = env.reset()
+                        done = [False] * env.n_drones
+                        steps = 0
+                        # reset per-episode seen grids/visited
+                        seen_grids = [set() for _ in range(env.n_drones)]
+                        env.fires_visited = [set() for _ in range(env.n_drones)]
+                        total_reward = [0.0 for _ in range(env.n_drones)]
+
+                        while not all(done) and steps < steps_per_episode:
+                            actions = np.zeros((env.n_drones, 3))
+                            for i in range(env.n_drones):
+                                if not done[i]:
+                                    # simple exploration schedule: random for initial part, then policy
+                                    if steps < 10:
+                                        actions[i] = np.random.uniform(-1, 1, size=(3,))
+                                    else:
+                                        actions[i] = agents[i].select_action(obs[i])
+                            next_obs, rewards, done, _, info = env.step(actions, seen_grids=seen_grids)
+                            # store and train
+                            for i in range(env.n_drones):
+                                agents[i].store(obs[i], actions[i], float(np.clip(rewards[i], -REWARD_CLIP, REWARD_CLIP)), next_obs[i], float(done[i]))
+                                agents[i].train()
+                                total_reward[i] += float(rewards[i])
+                            obs = next_obs
+                            steps += 1
+
+                        # Episode done: collect metrics
+                        total_points = sum(total_reward)
+                        # fires viewed: union sizes
+                        fires_viewed = sum(len(s) for s in getattr(env, 'fires_visited', [set(), set()]))
+                        # boxes explored: union of seen grids across drones
+                        boxes_explored = len(set().union(*seen_grids)) if seen_grids else 0
+                        mode_episode_rewards.append(total_points)
+                        mode_episode_fires.append(fires_viewed)
+                        mode_episode_boxes.append(boxes_explored)
+
+                        print(f"Mode {mode_name} Level {curriculum_level+1} ep {ep+1}/{episodes_per_mode}: total_points={total_points:.2f}, fires_viewed={fires_viewed}, boxes_explored={boxes_explored}")
+
+            # Compute per-mode averages using last-10% of episodes (fall back to full mean if too small)
+            import numpy as _np
+            def _last_percent_means(rewards_list, fires_list, boxes_list, percent=0.10):
+                n = len(rewards_list)
+                if n == 0:
+                    return float('nan'), float('nan'), float('nan'), 0
+                last_n = max(1, int(max(1, n * percent)))
+                tail_rewards = rewards_list[-last_n:]
+                tail_fires = fires_list[-last_n:] if fires_list else []
+                tail_boxes = boxes_list[-last_n:] if boxes_list else []
+                def safe_mean(arr):
+                    try:
+                        if not arr:
+                            return float('nan')
+                        return float(_np.nanmean(_np.array(arr, dtype=float)))
+                    except Exception:
+                        return float('nan')
+                return safe_mean(tail_rewards), safe_mean(tail_fires), safe_mean(tail_boxes), last_n
+
+            avg_reward, avg_fires, avg_boxes, used_count = _last_percent_means(mode_episode_rewards, mode_episode_fires, mode_episode_boxes, percent=0.10)
+            # If for some reason last-percent yields nan and we have data, fall back to overall means
+            if (_np.isnan(avg_reward) or _np.isnan(avg_fires) or _np.isnan(avg_boxes)) and mode_episode_rewards:
+                try:
+                    avg_reward = float(_np.nanmean(_np.array(mode_episode_rewards, dtype=float)))
+                except Exception:
+                    avg_reward = float('nan')
+                try:
+                    avg_fires = float(_np.nanmean(_np.array(mode_episode_fires, dtype=float)))
+                except Exception:
+                    avg_fires = float('nan')
+                try:
+                    avg_boxes = float(_np.nanmean(_np.array(mode_episode_boxes, dtype=float)))
+                except Exception:
+                    avg_boxes = float('nan')
+
+            ablation_results.append({'mode': mode_name, 'avg_reward': avg_reward, 'avg_fires': avg_fires, 'avg_boxes': avg_boxes, 'n_used': used_count})
+
+               # Plot avg_fires and avg_boxes for each mode using dual-axis bar chart (fires left, boxes right)
+                # After all modes: print summary and plot
+        print("\n=== Ablation Summary ===")
+        for r in ablation_results:
+            print(f"{r['mode']}: avg_reward={r['avg_reward']:.2f}, avg_fires={r['avg_fires']:.2f}, avg_boxes={r['avg_boxes']:.2f}")
+        import numpy as _np
+        try:
+            import matplotlib.pyplot as _plt
+            labels = [r['mode'] for r in ablation_results]
+            # clean labels for display: 'baseline_all_on' -> 'baseline', 'no_<key>' -> '<key>'
+            labels_clean = [ ("baseline" if m == "baseline_all_on" else m.replace("no_", "")) for m in labels ]
+            x = list(range(len(labels_clean)))
+            fires = [r.get('avg_fires', float('nan')) for r in ablation_results]
+            boxes = [r.get('avg_boxes', float('nan')) for r in ablation_results]
+
+            # Match attached image aesthetics (pixel-accurate approximation)
+            dpi = 100
+            fig_w, fig_h = 12.8, 7.2  # 1280x720 at 100 dpi
+            fig, ax_left = _plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
+            # Build grouped bars: for each component show two bars side-by-side
+            # left = 'no_<component>' (ablated) fires, right = baseline_all_on fires
+            # For boxes explored we plot on the right y-axis with the same grouping
+            # Determine component order (exclude 'baseline_all_on')
+            try:
+                comp_order = [c[0] for c in comp_list]
+            except Exception:
+                # fallback: derive from ablation_results
+                comp_order = []
+                for r in ablation_results:
+                    name = r['mode']
+                    if name.startswith('no_'):
+                        comp_order.append(name[3:])
+                # keep unique while preserving order
+                seenc = set(); comp_order = [x for x in comp_order if not (x in seenc or seenc.add(x))]
+
+            # Extract baseline values
+            baseline = next((r for r in ablation_results if r['mode'] == 'baseline_all_on'), None)
+            base_fires = baseline['avg_fires'] if baseline is not None else float('nan')
+            base_boxes = baseline['avg_boxes'] if baseline is not None else float('nan')
+
+            n = len(comp_order)
+            positions = np.arange(n)
+            offset = 0.18
+            width = 0.36
+
+            # gather arrays
+            ab_fires = []
+            ab_boxes = []
+            for comp in comp_order:
+                mode_name = f'no_{comp}'
+                entry = next((r for r in ablation_results if r['mode'] == mode_name), None)
+                if entry is None:
+                    ab_fires.append(float('nan'))
+                    ab_boxes.append(float('nan'))
+                else:
+                    ab_fires.append(entry.get('avg_fires', float('nan')))
+                    ab_boxes.append(entry.get('avg_boxes', float('nan')))
+
+            # Baseline arrays (repeat baseline value for each comp)
+            base_fires_arr = [base_fires] * n
+            base_boxes_arr = [base_boxes] * n
+
+            # Plot boxes on right axis first (behind)
+            ax_right = ax_left.twinx()
+            box_width = width * 0.96
+            bars_base_boxes = ax_right.bar(positions + offset, base_boxes_arr, width=box_width, facecolor='#d62728', edgecolor='k', alpha=0.95, label='Baseline Boxes', zorder=1, linewidth=0.6)
+            bars_ab_boxes = ax_right.bar(positions - offset, ab_boxes, width=box_width, facecolor='#2ca02c', edgecolor='k', alpha=0.95, label='Ablated Boxes', zorder=1, linewidth=0.6)
+
+            # Plot fires on left axis (on top) - use solid full-opacity green and higher z-order
+            bars_ab_fires = ax_left.bar(positions - offset, ab_fires, width=width, facecolor='#2ca02c', edgecolor='k', alpha=1.0, label='Ablated Fires', zorder=4, linewidth=0.6)
+            bars_base_fires = ax_left.bar(positions + offset, base_fires_arr, width=width, facecolor='#2ca02c', edgecolor='k', alpha=0.85, label='Baseline Fires', zorder=3, linewidth=0.6)
+
+            # Labels and black text
+            ax_left.set_ylabel('Fires Viewed', color='k', fontsize=12)
+            ax_left.tick_params(axis='y', labelcolor='k', labelsize=11, colors='k')
+            ax_right.set_ylabel('Boxes Explored', color='k', fontsize=12)
+            ax_right.tick_params(axis='y', labelcolor='k', labelsize=11, colors='k')
+
+            ax_left.set_xticks(positions)
+            labels_clean_short = [comp for comp in comp_order]
+            ax_left.set_xticklabels(labels_clean_short, rotation=35, ha='right', fontsize=10, color='k')
+
+            # Axis limits
+            try:
+                max_f = max([v for v in (ab_fires + base_fires_arr) if not (_np.isnan(v))], default=2.0)
+                ax_left.set_ylim(0, max(2.0, max_f * 1.15))
+            except Exception:
+                ax_left.set_ylim(0, 2.0)
+            try:
+                max_b = max([v for v in (ab_boxes + base_boxes_arr) if not (_np.isnan(v))], default=100.0)
+                ax_right.set_ylim(0, max(100.0, max_b * 1.05))
+            except Exception:
+                ax_right.set_ylim(0, 100.0)
+
+            # Spines black
+            for spine in ax_left.spines.values():
+                spine.set_edgecolor('k')
+            for spine in ax_right.spines.values():
+                spine.set_edgecolor('k')
+
+            # Legend
+            from matplotlib.patches import Patch
+            legend_handles = [Patch(facecolor='#2ca02c', label='Fires Viewed'), Patch(facecolor='#d62728', label='Boxes Explored')]
+            ax_left.legend(handles=legend_handles, loc='upper left', frameon=True, edgecolor='k', fontsize=11)
+
+            fig.subplots_adjust(bottom=0.22, left=0.08, right=0.92, top=0.95)
+            outp = plots_dir / f'ablation_summary_s{ablation_scenario}_e{episodes_per_mode}.png'
+            fig.savefig(outp, dpi=200)
+            print(f"Saved ablation summary plot to {outp}")
+        except Exception as e:
+            print("Failed to produce ablation summary plot:", e)
+        # After ablation sweep is complete, exit main (avoid running full interactive training)
+        return
     # Debug: show configured number of episodes per curriculum level
     print(f"Configured curriculum_episodes = {curriculum_episodes}")
     # Use the user-provided curriculum_episodes above; do not override it here
@@ -1723,7 +2001,8 @@ def main():
 
     # Allow user to configure which reward components are active (useful for ablation studies)
     # Present a numbered menu to make automated entry easier.
-    comp_list = [
+    if ablation_mode == 'y':
+        comp_list = [
         ('proximity', 'Proximity rewards & penalties'),
         ('exploration', 'Exploration cell rewards'),
         ('energy', 'Per-step energy penalty'),
@@ -1735,45 +2014,48 @@ def main():
         ('optimal', 'Optimal proximity small bonus'),
         ('cell_regen', 'Cell reward regeneration'),
     ]
-    print("Reward component toggles (enter numbers to ENABLE):")
-    for idx, (_, desc) in enumerate(comp_list, start=1):
-        key = comp_list[idx-1][0]
-        print(f"  {idx}: {desc} (key='{key}', default={'ON' if REWARD_COMPONENTS.get(key, True) else 'OFF'})")
-    print("Commands: blank=use defaults, 'all' = enable all, 'none' = disable all")
-    rc_input = input("Enter numbers to ENABLE (comma-separated, ranges OK e.g. 1,3-5): ").strip().lower()
-    if rc_input == '':
-        # keep defaults
-        pass
-    elif rc_input == 'all':
-        for k in REWARD_COMPONENTS:
-            REWARD_COMPONENTS[k] = True
-    elif rc_input == 'none':
-        for k in REWARD_COMPONENTS:
-            REWARD_COMPONENTS[k] = False
-    else:
-        chosen = set()
-        parts = [p.strip() for p in rc_input.split(',') if p.strip()]
-        for p in parts:
-            if '-' in p:
-                try:
-                    a, b = p.split('-', 1)
-                    a_i = int(a); b_i = int(b)
-                    for n in range(min(a_i, b_i), max(a_i, b_i)+1):
+        print("Reward component toggles (enter numbers to ENABLE):")
+        for idx, (_, desc) in enumerate(comp_list, start=1):
+            key = comp_list[idx-1][0]
+            print(f"  {idx}: {desc} (key='{key}', default={'ON' if REWARD_COMPONENTS.get(key, True) else 'OFF'})")
+        print("Commands: blank=use defaults, 'all' = enable all, 'none' = disable all")
+        rc_input = input("Enter numbers to ENABLE (comma-separated, ranges OK e.g. 1,3-5): ").strip().lower()
+        if rc_input == '':
+            # keep defaults
+            pass
+        elif rc_input == 'all':
+            for k in REWARD_COMPONENTS:
+                REWARD_COMPONENTS[k] = True
+        elif rc_input == 'none':
+            for k in REWARD_COMPONENTS:
+                REWARD_COMPONENTS[k] = False
+        else:
+            chosen = set()
+            parts = [p.strip() for p in rc_input.split(',') if p.strip()]
+            for p in parts:
+                if '-' in p:
+                    try:
+                        a, b = p.split('-', 1)
+                        a_i = int(a); b_i = int(b)
+                        for n in range(min(a_i, b_i), max(a_i, b_i)+1):
+                            if 1 <= n <= len(comp_list):
+                                chosen.add(comp_list[n-1][0])
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        n = int(p)
                         if 1 <= n <= len(comp_list):
                             chosen.add(comp_list[n-1][0])
-                except Exception:
-                    pass
-            else:
-                try:
-                    n = int(p)
-                    if 1 <= n <= len(comp_list):
-                        chosen.add(comp_list[n-1][0])
-                except Exception:
-                    pass
-        # enable chosen, disable the rest
-        for k in REWARD_COMPONENTS:
-            REWARD_COMPONENTS[k] = (k in chosen)
-    print(f"Using reward components: {REWARD_COMPONENTS}")
+                    except Exception:
+                        pass
+            # enable chosen, disable the rest
+            for k in REWARD_COMPONENTS:
+                REWARD_COMPONENTS[k] = (k in chosen)
+        print(f"Using reward components: {REWARD_COMPONENTS}")
+    else:
+        # Not in ablation mode: keep REWARD_COMPONENTS at defaults and do not prompt
+        print("Ablation mode not selected: using default reward components.")
 
     for scenario_idx, scenario in enumerate(scenarios):
         print(f"\n=== SCENARIO {scenario}: {scenario_names[scenario]} ===")
