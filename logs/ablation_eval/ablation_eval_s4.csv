@@ -1,0 +1,12 @@
+mode_name,pkl_path,avg_reward,std_reward,avg_fires,std_fires,avg_boxes,std_boxes,success_rate,episodes
+ablation_baseline_all_on_agent_0,logs\ablation_baseline_all_on_agent_0.pkl,-15739.546975924988,11495.83245475587,1.14,1.0584894897919392,166.36,28.051210312569406,0.0,50
+ablation_no_cell_regen_agent_0,logs\ablation_no_cell_regen_agent_0.pkl,-27954.794951879987,6935.650703943707,0.0,0.0,47.82,35.06604625560173,0.0,50
+ablation_no_discovery_agent_0,logs\ablation_no_discovery_agent_0.pkl,-27509.061801490523,7466.167924117011,0.0,0.0,63.5,45.33707092435505,0.0,50
+ablation_no_edge_agent_0,logs\ablation_no_edge_agent_0.pkl,-30000.0,0.0,0.0,0.0,35.62,12.823244519231473,0.0,50
+ablation_no_energy_agent_0,logs\ablation_no_energy_agent_0.pkl,-28046.657202329956,6624.312446810365,0.02,0.13999999999999999,44.12,33.46379536155455,0.0,50
+ablation_no_exploration_agent_0,logs\ablation_no_exploration_agent_0.pkl,-30000.0,0.0,0.0,0.0,47.42,24.35905581092995,0.0,50
+ablation_no_lateral_agent_0,logs\ablation_no_lateral_agent_0.pkl,-7976.736943476364,984.1930880987753,0.12,0.43081318457076034,213.62,35.95936039475674,0.0,50
+ablation_no_movement_agent_0,logs\ablation_no_movement_agent_0.pkl,-29992.241469441567,53.60397488596655,0.02,0.13999999999999999,49.74,24.142750464684013,0.0,50
+ablation_no_optimal_agent_0,logs\ablation_no_optimal_agent_0.pkl,-28974.98149991814,5021.556684551706,0.0,0.0,38.84,24.584840857731827,0.0,50
+ablation_no_proximity_agent_0,logs\ablation_no_proximity_agent_0.pkl,-5571.478991616438,529.9884318988081,0.0,0.0,219.6,20.406861591141347,0.0,50
+ablation_no_stationary_penalty_agent_0,logs\ablation_no_stationary_penalty_agent_0.pkl,-30000.0,0.0,0.0,0.0,43.48,13.641466196857287,0.0,50

@@ -107,9 +107,13 @@ ACT_REG = 5e-3
 
 # --- ENVIRONMENT ---
 class DroneEnv(gym.Env):
-    def __init__(self, area_size=10, drone_radius=0.25, fire_line=((5,5,0),(5,5,10)), fire_radius=0.25, safety_margin=0.1, max_step_size=0.5, curriculum_level=0, scenario=1):
+    def __init__(self, area_size=20, drone_radius=0.25, fire_line=((10,5,0),(10,5,20)), fire_radius=0.25, safety_margin=0.1, max_step_size=0.5, curriculum_level=0, scenario=1):
         super().__init__()
-        self.area_size = area_size
+        self.x_max = 20  # X dimension
+        self.y_max = 10  # Y dimension
+        self.z_min = 5   # Z minimum
+        self.z_max = 10  # Z maximum
+        self.area_size = area_size  # For backward compatibility
         # Halve drone radius and safety margin (bounding box) for all scenarios
         self.drone_radius = drone_radius
         self.fire_line = np.array(fire_line)
@@ -129,39 +133,38 @@ class DroneEnv(gym.Env):
         self.fire_centers = []
         # For scenario 2: fire spread state
         if scenario == 2:
-            self.fire_centers = [np.mean(self.fire_line, axis=0)]  # List of fire centers
+            self.fire_centers = [np.array([10.0, 5.0, 5.0])]  # List of fire centers
             # fire_radius already set above
             self.fire_spread_rate = 0.5  # Not used, but kept for compatibility
             self.fire_spawn_radius = 5.0  # New fires spawn within this radius from any fire
             self.max_fires = 8  # Limit number of fires for performance
-        # Scenario 3: line of fires (cylinders) along x axis
+        # Scenario 3: line of fires (cylinders) along y axis
         elif scenario == 3:
-            # Place fires at regular intervals along x axis at y=area_size/2, z=5 (on ground)
-            n_fires = 10
-            x_positions = np.linspace(1, self.area_size-1, n_fires)
-            y_pos = self.area_size / 2
+            # Place fires at regular intervals along y axis at x=5, z=5 (on ground)
+            n_fires = 8
+            y_positions = np.linspace(1, self.y_max-1, n_fires)
+            x_pos = 10.0
             z_pos = 5.0
-            self.fire_centers = [np.array([x, y_pos, z_pos]) for x in x_positions]
+            self.fire_centers = [np.array([x_pos, y, z_pos]) for y in y_positions]
             # fire_radius already set above
-        # Scenario 5: impassable fire wall along x axis
+        # Scenario 5: impassable fire wall along x axis at x=10
         elif scenario == 5:
-            self.fire_wall_x = self.area_size / 2
+            self.fire_wall_x = 10.0
             # fire_radius already set above
             self.fire_centers = []  # Ensure attribute exists for visualization
-        # Scenario 4: 5 randomly placed fires
+        # Scenario 4: 5 fires at specific spawn points
         elif scenario == 4:
-            n_fires = 5
-            self.fire_centers = []
-            for _ in range(n_fires):
-                # Place fires randomly in the area, at random z between 5 and 10
-                x = np.random.uniform(1, self.area_size-1)
-                y = np.random.uniform(1, self.area_size-1)
-                z = np.random.uniform(5, 10)
-                self.fire_centers.append(np.array([x, y, z]))
+            self.fire_centers = [
+                np.array([10.0, 5.0, 5.0]),
+                np.array([14.0, 2.0, 5.0]),
+                np.array([8.0, 8.0, 5.0]),
+                np.array([14.0, 8.0, 5.0]),
+                np.array([8.0, 2.0, 5.0])
+            ]
             # fire_radius already set above
         # Scenario 6: large central fire
         elif scenario == 6:
-            center = np.array([self.area_size / 2, self.area_size / 2, self.area_size / 2])
+            center = np.array([10.0, 5.0, (self.z_max + self.z_min) / 2])
             self.fire_centers = [center]
             self.fire_radius = 2.5  # Large fire size for scenario 6
         self.action_space = spaces.Box(low=-1, high=1, shape=(self.n_drones,3), dtype=np.float32)
@@ -181,14 +184,14 @@ class DroneEnv(gym.Env):
             np.full((self.max_visible_fires * per_fire_len,), 0.0, dtype=np.float32)
         ])
         high = np.concatenate([
-            np.array([area_size, area_size, area_size, 1, area_size, area_size, area_size, area_size, area_size, area_size], dtype=np.float32),
-            np.full((self.max_visible_fires * per_fire_len,), area_size, dtype=np.float32)
+            np.array([self.x_max, self.y_max, self.z_max, 1, self.x_max, self.y_max, self.z_max, self.x_max, self.y_max, self.z_max], dtype=np.float32),
+            np.full((self.max_visible_fires * per_fire_len,), self.x_max, dtype=np.float32)
         ])
         # Shape is (n_drones, total_len)
         self.observation_space = spaces.Box(low=np.tile(low, (self.n_drones, 1)), high=np.tile(high, (self.n_drones, 1)), dtype=np.float32)
         # --- Add cell_rewards for regenerating reward ---
         grid_size = 0.5
-        grid_dim = int(self.area_size // grid_size)
+        grid_dim = int(self.x_max // grid_size)
         self.grid_size = grid_size
         self.grid_dim = grid_dim
         # Keep per-cell rewards small to avoid runaway episode sums
@@ -208,11 +211,16 @@ class DroneEnv(gym.Env):
         safe = False
         max_attempts = 10
         for _ in range(max_attempts):
-            pos1 = np.random.uniform(0.5, self.area_size - 0.5, size=3)
-            pos2 = np.random.uniform(0.5, self.area_size - 0.5, size=3)
-            # Force z to be between 5 and 10
-            pos1[2] = np.random.uniform(5, 10)
-            pos2[2] = np.random.uniform(5, 10)
+            # Drone 1 starts at x=20, Drone 2 starts at x=0
+            # y and z are random for both
+            pos1_y = np.random.uniform(0.5, self.y_max - 0.5)
+            pos1_z = np.random.uniform(5, 10)
+            pos2_y = np.random.uniform(0.5, self.y_max - 0.5)
+            pos2_z = np.random.uniform(5, 10)
+            pos1 = np.array([20.0, pos1_y, pos1_z])
+            pos2 = np.array([0.0, pos2_y, pos2_z])
+            # Ensure pos1[0] doesn't exceed area_size
+            pos1[0] = min(pos1[0], self.x_max - 0.5)
             dist1 = point_to_segment_dist(pos1, self.fire_line[0], self.fire_line[1])
             dist2 = point_to_segment_dist(pos2, self.fire_line[0], self.fire_line[1])
             min_dist = self.drone_radius + self.fire_radius + self.safety_margin
@@ -221,29 +229,29 @@ class DroneEnv(gym.Env):
                 safe = True
                 break
         if not safe:
-            pos1 = np.array([1.0, 1.0, 7.5])  # z in [5,10]
-            pos2 = np.array([8.0, 8.0, 7.5])
+            pos1 = np.array([19.5, 5.0, 7.5])  # x near 20, random y, z in [5,10]
+            pos2 = np.array([0.5, 5.0, 7.5])   # x near 0, random y, z in [5,10]
         self.drone_pos = np.stack([pos1, pos2])
         self.done = [False, False]
         self.cell_rewards = np.full((self.grid_dim, self.grid_dim), self.max_cell_reward, dtype=np.int32)  # Reset cell rewards to max
         if self.scenario == 2:
-            self.fire_centers = [np.mean(self.fire_line, axis=0)]
+            self.fire_centers = [np.array([10.0, 5.0, 5.0])]
         if self.scenario == 3:
-            n_fires = 10
-            x_positions = np.linspace(1, self.area_size-1, n_fires)
-            y_pos = self.area_size / 2
+            n_fires = 8
+            y_positions = np.linspace(1, self.y_max-1, n_fires)
+            x_pos = 10.0
             z_pos = 5.0
-            self.fire_centers = [np.array([x, y_pos, z_pos]) for x in x_positions]
+            self.fire_centers = [np.array([x_pos, y, z_pos]) for y in y_positions]
         if self.scenario == 4:
-            n_fires = 5
-            self.fire_centers = []
-            for _ in range(n_fires):
-                x = np.random.uniform(1, self.area_size-1)
-                y = np.random.uniform(1, self.area_size-1)
-                z = np.random.uniform(5, 10)
-                self.fire_centers.append(np.array([x, y, z]))
+            self.fire_centers = [
+                np.array([10.0, 5.0, 5.0]),
+                np.array([12.0, 3.0, 5.0]),
+                np.array([8.0, 6.0, 5.0]),
+                np.array([12.0, 6.0, 5.0]),
+                np.array([8.0, 3.0, 5.0])
+            ]
         if self.scenario == 5:
-            # No fire centers, just a wall at x=area_size/2
+            # No fire centers, just a wall at x=5
             self.fire_centers = []  # Ensure attribute exists for visualization
         return self._get_obs(), {}
 
@@ -288,7 +296,7 @@ class DroneEnv(gym.Env):
                 a, b = self.fire_line[0], self.fire_line[1]
             else:
                 a = np.array([self.fire_wall_x, 0])
-                b = np.array([self.fire_wall_x, self.area_size])
+                b = np.array([self.fire_wall_x, self.y_max])
             fire_centers_2d = np.array([a + (b - a) * t for t in np.linspace(0, 1, n_points)])
 
         for i in range(self.n_drones):
@@ -404,16 +412,16 @@ class DroneEnv(gym.Env):
                 rewards[i] = COLLISION_PENALTY
                 dones[i] = True
                 continue
-            # Scenario 5: impassable fire wall at x=area_size/2
+            # Scenario 5: impassable fire wall at x=5
             if self.scenario == 5:
                 x0 = self.drone_pos[i][0]
-                x1 = np.clip(self.drone_pos[i][0] + a[0], 0, self.area_size)
+                x1 = np.clip(self.drone_pos[i][0] + a[0], 0, self.x_max)
                 if (x0 < self.fire_wall_x and x1 >= self.fire_wall_x) or (x0 > self.fire_wall_x and x1 <= self.fire_wall_x):
                     rewards[i] = COLLISION_PENALTY
                     dones[i] = True
                     continue
             # Normal movement if not crashing or hitting wall
-            self.drone_pos[i] = np.clip(self.drone_pos[i] + a, [0, 0, 5], [self.area_size, self.area_size, 10])
+            self.drone_pos[i] = np.clip(self.drone_pos[i] + a, [0, 0, self.z_min], [self.x_max, self.y_max, self.z_max])
 
         # Scenario 2: fire spreads each step
         if self.scenario == 2:
@@ -429,7 +437,7 @@ class DroneEnv(gym.Env):
                         dz = height
                         new_center = center + np.array([dx, dy, dz])
                         # Keep within bounds
-                        new_center = np.clip(new_center, [0, 0, 5], [self.area_size, self.area_size, 10])
+                        new_center = np.clip(new_center, [0, 0, self.z_min], [self.x_max, self.y_max, self.z_max])
                         # Only add if not too close to existing fires
                         if all(np.linalg.norm(new_center - fc) > self.fire_radius * 1.5 for fc in self.fire_centers):
                             self.fire_centers.append(new_center)
@@ -559,7 +567,7 @@ class DroneEnv(gym.Env):
                     a, b = self.fire_line[0], self.fire_line[1]
                 else:
                     a = np.array([self.fire_wall_x, 0])
-                    b = np.array([self.fire_wall_x, self.area_size])
+                    b = np.array([self.fire_wall_x, self.y_max])
                 fire_centers_2d = np.array([a + (b - a) * t for t in np.linspace(0, 1, n_points)])
             for gx in range(x_min, x_max+1):
                 for gy in range(y_min, y_max+1):
@@ -617,7 +625,7 @@ class DroneEnv(gym.Env):
         for i in range(self.n_drones):
             pos = self.drone_pos[i]
             # Distance to each wall (x=0, x=max, y=0, y=max, z=5, z=10)
-            dists = [pos[0], self.area_size - pos[0], pos[1], self.area_size - pos[1], pos[2] - 5, 10 - pos[2]]
+            dists = [pos[0], self.x_max - pos[0], pos[1], self.y_max - pos[1], pos[2] - self.z_min, self.z_max - pos[2]]
             min_dist = min(dists)
             # Only apply edge penalty when very close to walls
             if min_dist < 1.0:  # Only within 1 unit of walls
@@ -731,21 +739,28 @@ class DroneEnv(gym.Env):
         fig = plt.figure(1)
         plt.clf()
         ax = fig.add_subplot(111, projection='3d')
-        ax.set_xlim([0, self.area_size])
-        ax.set_ylim([0, self.area_size])
-        ax.set_zlim([0, self.area_size])
+        ax.set_xlim([0, self.x_max])
+        ax.set_ylim([0, self.y_max])
+        ax.set_zlim([0, self.z_max])
+        # Set proper aspect ratio for rectangular prism (20x10x10)
+        ax.set_box_aspect([self.x_max, self.y_max, self.z_max])
+        # Set grid lines at 2-unit intervals
+        ax.set_xticks(np.arange(0, self.x_max + 1, 2))
+        ax.set_yticks(np.arange(0, self.y_max + 1, 2))
+        ax.set_zticks(np.arange(0, self.z_max + 1, 2))
+        ax.grid(True)
         # Draw fire line or fires
         if self.scenario == 5:
-            # Draw fire wall as a red plane at x=area_size/2
+            # Draw fire wall as a red plane at x=5
             fire_x = self.fire_wall_x
-            y = np.linspace(0, self.area_size, 2)
-            z = np.linspace(0, self.area_size, 2)
+            y = np.linspace(0, self.y_max, 2)
+            z = np.linspace(0, self.z_max, 2)
             Y, Z = np.meshgrid(y, z)
             X = np.full_like(Y, fire_x)
             ax.plot_surface(X, Y, Z, color='red', alpha=0.4)
         elif self.scenario in [2, 3, 4, 6]:
             # Draw all fire centers as vertical cylinders attached to the floor
-            fire_height = self.area_size  # Cylinder height (floor to ceiling)
+            fire_height = self.z_max  # Cylinder height (floor to ceiling)
             n_cylinder = 24
             for fc in (fire_centers if fire_centers is not None else self.fire_centers):
                 # Cylinder base center at (fc[0], fc[1], 0), top at (fc[0], fc[1], fire_height)
@@ -1063,7 +1078,11 @@ class TD3Agent:
                 'noise_clip': self.noise_clip,
                 'policy_delay': self.policy_delay,
                 'batch_size': self.batch_size,
-                'total_it': self.total_it
+                'total_it': self.total_it,
+                'x_max': self.x_max,
+                'y_max': self.y_max,
+                'z_min': self.z_min,
+                'z_max': self.z_max
             }
         }
         with open(filename, 'wb') as f:
@@ -1176,7 +1195,7 @@ class TD3Agent:
     def decay_noise(self, decay_rate=0.99, min_noise=0.01):
         """Decay the noise levels by decay_rate, not going below min_noise."""
         self.noise_levels = [max(n * decay_rate, min_noise) for n in self.noise_levels]
-    def __init__(self, area_size, drone_radius, fire_line, fire_radius, safety_margin, max_step_size, obs_dim=7, act_dim=3, n_critics=2, n_candidates=30, noise_levels=None, gamma=0.95, tau=0.001, policy_noise=0.12, noise_clip=0.25, policy_delay=8, buffer_size=200000, batch_size=256, hidden_size=384):
+    def __init__(self, area_size, drone_radius, fire_line, fire_radius, safety_margin, max_step_size, obs_dim=7, act_dim=3, n_critics=2, n_candidates=30, noise_levels=None, gamma=0.95, tau=0.001, policy_noise=0.12, noise_clip=0.25, policy_delay=8, buffer_size=200000, batch_size=256, hidden_size=384, x_max=20, y_max=10, z_min=5, z_max=10):
         if noise_levels is None:
             # stronger initial candidate noise for exploration
             noise_levels = [0.1, 0.2, 0.3, 0.5]
@@ -1188,6 +1207,10 @@ class TD3Agent:
         self.max_step_size = max_step_size
         self.obs_dim = obs_dim
         self.act_dim = act_dim
+        self.x_max = x_max
+        self.y_max = y_max
+        self.z_min = z_min
+        self.z_max = z_max
         # Actor / Critic networks
         self.actor = Actor(self.obs_dim, self.act_dim, hidden=hidden_size)
         self.actor_target = Actor(self.obs_dim, self.act_dim, hidden=hidden_size)
@@ -1303,7 +1326,7 @@ class TD3Agent:
         scores = []
         for a in candidates:
             # Simulate next state (only position part)
-            sim_pos = np.clip(obs_np[:3] + a * self.max_step_size, [0, 0, 5], [self.area_size, self.area_size, 10])
+            sim_pos = np.clip(obs_np[:3] + a * self.max_step_size, [0, 0, self.z_min], [self.x_max, self.y_max, self.z_max])
             
             # Compute fire_below for simulated pos
             def point_to_segment_dist(p, a, b):
@@ -1622,7 +1645,7 @@ class TD3Agent:
 # --- MAIN LOOP ---
 def main():
     import os
-    scenario_names = {1: "Static Fire Line", 2: "Spreading Fire", 3: "Line of Fires", 4: "Random Fires", 5: "Impassable Fire Wall (w/ Random Crash)", 6: "Central Fire"}
+    scenario_names = {1: "Static Fire Line", 2: "Spreading Fire", 3: "Line of Fires", 4: "Random Static Fires", 5: "Impassable Fire Wall (w/ Random Crash)", 6: "Central Fire"}
     all_scenarios = sorted(list(scenario_names.keys()))
 
     # First question: ask whether to run an automated ablation study
@@ -1680,6 +1703,11 @@ def main():
             steps_per_episode = 300
     else:
         steps_per_episode = 300
+    
+    # Prepare logs directory early (needed for both ablation and regular training)
+    logs_dir = Path("logs")
+    logs_dir.mkdir(exist_ok=True)
+    
     # Ask if user wants to run an automated ablation sweep (use earlier answer if prompted first)
     if 'ablation_mode' not in locals():
         try:
@@ -1741,7 +1769,7 @@ def main():
             # Create environment and agents fresh for this mode
             env = DroneEnv(curriculum_level=0, scenario=ablation_scenario)
             obs, _ = env.reset()
-            agents = [TD3Agent(env.area_size, env.drone_radius, env.fire_line, env.fire_radius, env.safety_margin, env.max_step_size, obs_dim=env.observation_space.shape[1], act_dim=env.action_space.shape[1]) for _ in range(env.n_drones)]
+            agents = [TD3Agent(env.area_size, env.drone_radius, env.fire_line, env.fire_radius, env.safety_margin, env.max_step_size, obs_dim=env.observation_space.shape[1], act_dim=env.action_space.shape[1], x_max=env.x_max, y_max=env.y_max, z_min=env.z_min, z_max=env.z_max) for _ in range(env.n_drones)]
 
             # Per-episode accumulators
             mode_episode_rewards = []
@@ -1787,8 +1815,9 @@ def main():
 
                         # Episode done: collect metrics
                         total_points = sum(total_reward)
-                        # fires viewed: union sizes
-                        fires_viewed = sum(len(s) for s in getattr(env, 'fires_visited', [set(), set()]))
+                        # Count unique fires discovered (like we do for boxes) rather than per-drone sum
+                        all_fires = set().union(*(getattr(env, 'fires_visited', [set(), set()])))
+                        fires_viewed = len(all_fires)
                         # boxes explored: union of seen grids across drones
                         boxes_explored = len(set().union(*seen_grids)) if seen_grids else 0
                         mode_episode_rewards.append(total_points)
@@ -1797,154 +1826,167 @@ def main():
 
                         print(f"Mode {mode_name} Level {curriculum_level+1} ep {ep+1}/{episodes_per_mode}: total_points={total_points:.2f}, fires_viewed={fires_viewed}, boxes_explored={boxes_explored}")
 
-            # Compute per-mode averages using last-10% of episodes (fall back to full mean if too small)
-            import numpy as _np
-            def _last_percent_means(rewards_list, fires_list, boxes_list, percent=0.10):
-                n = len(rewards_list)
-                if n == 0:
-                    return float('nan'), float('nan'), float('nan'), 0
-                last_n = max(1, int(max(1, n * percent)))
-                tail_rewards = rewards_list[-last_n:]
-                tail_fires = fires_list[-last_n:] if fires_list else []
-                tail_boxes = boxes_list[-last_n:] if boxes_list else []
-                def safe_mean(arr):
-                    try:
-                        if not arr:
-                            return float('nan')
-                        return float(_np.nanmean(_np.array(arr, dtype=float)))
-                    except Exception:
-                        return float('nan')
-                return safe_mean(tail_rewards), safe_mean(tail_fires), safe_mean(tail_boxes), last_n
+            # Save trained agent weights for this mode
+            print(f"\nSaving trained weights for mode: {mode_name}")
+            mode_weights_path = logs_dir / f"ablation_{mode_name}_agent_0.pkl"
+            agents[0].save(str(mode_weights_path))
+            print(f"Saved weights to {mode_weights_path}")
 
-            avg_reward, avg_fires, avg_boxes, used_count = _last_percent_means(mode_episode_rewards, mode_episode_fires, mode_episode_boxes, percent=0.10)
-            # If for some reason last-percent yields nan and we have data, fall back to overall means
-            if (_np.isnan(avg_reward) or _np.isnan(avg_fires) or _np.isnan(avg_boxes)) and mode_episode_rewards:
-                try:
-                    avg_reward = float(_np.nanmean(_np.array(mode_episode_rewards, dtype=float)))
-                except Exception:
-                    avg_reward = float('nan')
-                try:
-                    avg_fires = float(_np.nanmean(_np.array(mode_episode_fires, dtype=float)))
-                except Exception:
-                    avg_fires = float('nan')
-                try:
-                    avg_boxes = float(_np.nanmean(_np.array(mode_episode_boxes, dtype=float)))
-                except Exception:
-                    avg_boxes = float('nan')
+            # Run 1000 deterministic evaluation episodes with trained weights
+            print(f"\nRunning 500 deterministic evaluation episodes for mode: {mode_name}")
+            eval_rewards = []
+            eval_fires = []
+            eval_boxes = []
+            eval_success = []
 
-            ablation_results.append({'mode': mode_name, 'avg_reward': avg_reward, 'avg_fires': avg_fires, 'avg_boxes': avg_boxes, 'n_used': used_count})
+            # Use curriculum level 4 (easiest) for deterministic evaluation
+            eval_env = DroneEnv(curriculum_level=4, scenario=ablation_scenario)
+            eval_agents = [TD3Agent(eval_env.area_size, eval_env.drone_radius, eval_env.fire_line, eval_env.fire_radius, eval_env.safety_margin, eval_env.max_step_size, obs_dim=eval_env.observation_space.shape[1], act_dim=eval_env.action_space.shape[1], x_max=eval_env.x_max, y_max=eval_env.y_max, z_min=eval_env.z_min, z_max=eval_env.z_max) for _ in range(eval_env.n_drones)]
+            # Load trained weights into ALL evaluation agents (both drones use same weights)
+            for eval_agent in eval_agents:
+                eval_agent.load(str(mode_weights_path))
+#determineistic 1000 evaluation
+            for eval_ep in range(500):
+                eval_obs, _ = eval_env.reset()
+                eval_done = [False] * eval_env.n_drones
+                eval_steps = 0
+                eval_seen_grids = [set() for _ in range(eval_env.n_drones)]
+                eval_env.fires_visited = [set() for _ in range(eval_env.n_drones)]
+                eval_total_reward = [0.0 for _ in range(eval_env.n_drones)]
+
+                while not all(eval_done) and eval_steps < steps_per_episode:
+                    eval_actions = np.zeros((eval_env.n_drones, 3))
+                    for i in range(eval_env.n_drones):
+                        if not eval_done[i]:
+                            # Deterministic evaluation
+                            eval_actions[i] = eval_agents[i].select_action(eval_obs[i], deterministic=True)
+                    eval_next_obs, eval_rewards_step, eval_done, _, _ = eval_env.step(eval_actions, seen_grids=eval_seen_grids)
+                    for i in range(eval_env.n_drones):
+                        eval_total_reward[i] += float(np.clip(eval_rewards_step[i], -REWARD_CLIP, REWARD_CLIP))
+                    eval_obs = eval_next_obs
+                    eval_steps += 1
+
+                # Collect eval metrics
+                eval_points = sum(eval_total_reward)
+                # Count unique fires discovered (like we do for boxes) rather than per-drone sum
+                all_fires = set().union(*(getattr(eval_env, 'fires_visited', [set(), set()])))
+                eval_fires_count = len(all_fires)
+                eval_boxes_count = len(set().union(*eval_seen_grids)) if eval_seen_grids else 0
+                # Success: both drones didn't collide (total reward > penalty threshold)
+                eval_ep_success = 1 if all(r > COLLISION_PENALTY for r in eval_total_reward) else 0
+
+                eval_rewards.append(eval_points)
+                eval_fires.append(eval_fires_count)
+                eval_boxes.append(eval_boxes_count)
+                eval_success.append(eval_ep_success)
+
+                if (eval_ep + 1) % 100 == 0:
+                    print(f"  Evaluation progress: {eval_ep + 1}/500 episodes completed")
+
+            # Compute evaluation statistics
+            avg_reward = float(np.mean(eval_rewards))
+            avg_fires = float(np.mean(eval_fires))
+            avg_boxes = float(np.mean(eval_boxes))
+            success_rate = float(np.mean(eval_success))
+            std_fires = float(np.std(eval_fires))
+            std_boxes = float(np.std(eval_boxes))
+            
+            print(f"Evaluation results for {mode_name}:")
+            print(f"  Avg reward (1000 episodes): {avg_reward:.2f}")
+            print(f"  Avg fires viewed: {avg_fires:.2f} ± {std_fires:.2f}")
+            print(f"  Avg boxes explored: {avg_boxes:.2f} ± {std_boxes:.2f}")
+            print(f"  Success rate: {success_rate:.2%}")
+
+            ablation_results.append({'mode': mode_name, 'avg_reward': avg_reward, 'avg_fires': avg_fires, 'avg_boxes': avg_boxes, 'success_rate': success_rate, 'std_fires': std_fires, 'std_boxes': std_boxes})
 
                # Plot avg_fires and avg_boxes for each mode using dual-axis bar chart (fires left, boxes right)
                 # After all modes: print summary and plot
-        print("\n=== Ablation Summary ===")
+        print("\n=== Ablation Summary (500 Deterministic Evaluation Episodes) ===")
         for r in ablation_results:
-            print(f"{r['mode']}: avg_reward={r['avg_reward']:.2f}, avg_fires={r['avg_fires']:.2f}, avg_boxes={r['avg_boxes']:.2f}")
+            print(f"{r['mode']}: avg_reward={r['avg_reward']:.2f}, avg_fires={r['avg_fires']:.2f}±{r['std_fires']:.2f}, avg_boxes={r['avg_boxes']:.2f}±{r['std_boxes']:.2f}, success_rate={r['success_rate']:.2%}")
         import numpy as _np
         try:
             import matplotlib.pyplot as _plt
-            labels = [r['mode'] for r in ablation_results]
-            # clean labels for display: 'baseline_all_on' -> 'baseline', 'no_<key>' -> '<key>'
-            labels_clean = [ ("baseline" if m == "baseline_all_on" else m.replace("no_", "")) for m in labels ]
-            x = list(range(len(labels_clean)))
-            fires = [r.get('avg_fires', float('nan')) for r in ablation_results]
-            boxes = [r.get('avg_boxes', float('nan')) for r in ablation_results]
-
-            # Match attached image aesthetics (pixel-accurate approximation)
-            dpi = 100
-            fig_w, fig_h = 12.8, 7.2  # 1280x720 at 100 dpi
-            fig, ax_left = _plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
-            # Build grouped bars: for each component show two bars side-by-side
-            # left = 'no_<component>' (ablated) fires, right = baseline_all_on fires
-            # For boxes explored we plot on the right y-axis with the same grouping
-            # Determine component order (exclude 'baseline_all_on')
-            try:
-                comp_order = [c[0] for c in comp_list]
-            except Exception:
-                # fallback: derive from ablation_results
-                comp_order = []
-                for r in ablation_results:
-                    name = r['mode']
-                    if name.startswith('no_'):
-                        comp_order.append(name[3:])
-                # keep unique while preserving order
-                seenc = set(); comp_order = [x for x in comp_order if not (x in seenc or seenc.add(x))]
-
-            # Extract baseline values
-            baseline = next((r for r in ablation_results if r['mode'] == 'baseline_all_on'), None)
-            base_fires = baseline['avg_fires'] if baseline is not None else float('nan')
-            base_boxes = baseline['avg_boxes'] if baseline is not None else float('nan')
-
-            n = len(comp_order)
-            positions = np.arange(n)
-            offset = 0.18
-            width = 0.36
-
-            # gather arrays
-            ab_fires = []
-            ab_boxes = []
-            for comp in comp_order:
-                mode_name = f'no_{comp}'
-                entry = next((r for r in ablation_results if r['mode'] == mode_name), None)
-                if entry is None:
-                    ab_fires.append(float('nan'))
-                    ab_boxes.append(float('nan'))
+            
+            # Organize results: baseline + all ablated modes
+            baseline_entry = next((r for r in ablation_results if r['mode'] == 'baseline_all_on'), None)
+            ablated_entries = [r for r in ablation_results if r['mode'].startswith('no_')]
+            ablated_entries_sorted = sorted(ablated_entries, key=lambda x: x['mode'][3:])
+            
+            ordered_results = []
+            if baseline_entry:
+                ordered_results.append(baseline_entry)
+            ordered_results.extend(ablated_entries_sorted)
+            
+            # Extract labels and data
+            labels = []
+            fires_means = []
+            fires_stds = []
+            boxes_means = []
+            boxes_stds = []
+            
+            for r in ordered_results:
+                mode_name = r['mode']
+                if mode_name == 'baseline_all_on':
+                    labels.append('baseline')
                 else:
-                    ab_fires.append(entry.get('avg_fires', float('nan')))
-                    ab_boxes.append(entry.get('avg_boxes', float('nan')))
-
-            # Baseline arrays (repeat baseline value for each comp)
-            base_fires_arr = [base_fires] * n
-            base_boxes_arr = [base_boxes] * n
-
-            # Plot boxes on right axis first (behind)
+                    labels.append(mode_name[3:])
+                fires_means.append(r['avg_fires'])
+                fires_stds.append(r['std_fires'])
+                boxes_means.append(r['avg_boxes'])
+                boxes_stds.append(r['std_boxes'])
+            
+            # Create figure with dual axes (2000x1200 at 100 dpi = 20x12 inches)
+            fig, ax_left = _plt.subplots(figsize=(20, 12), dpi=1000)
             ax_right = ax_left.twinx()
-            box_width = width * 0.96
-            bars_base_boxes = ax_right.bar(positions + offset, base_boxes_arr, width=box_width, facecolor='#d62728', edgecolor='k', alpha=0.95, label='Baseline Boxes', zorder=1, linewidth=0.6)
-            bars_ab_boxes = ax_right.bar(positions - offset, ab_boxes, width=box_width, facecolor='#2ca02c', edgecolor='k', alpha=0.95, label='Ablated Boxes', zorder=1, linewidth=0.6)
-
-            # Plot fires on left axis (on top) - use solid full-opacity green and higher z-order
-            bars_ab_fires = ax_left.bar(positions - offset, ab_fires, width=width, facecolor='#2ca02c', edgecolor='k', alpha=1.0, label='Ablated Fires', zorder=4, linewidth=0.6)
-            bars_base_fires = ax_left.bar(positions + offset, base_fires_arr, width=width, facecolor='#2ca02c', edgecolor='k', alpha=0.85, label='Baseline Fires', zorder=3, linewidth=0.6)
-
-            # Labels and black text
-            ax_left.set_ylabel('Fires Viewed', color='k', fontsize=12)
-            ax_left.tick_params(axis='y', labelcolor='k', labelsize=11, colors='k')
-            ax_right.set_ylabel('Boxes Explored', color='k', fontsize=12)
-            ax_right.tick_params(axis='y', labelcolor='k', labelsize=11, colors='k')
-
-            ax_left.set_xticks(positions)
-            labels_clean_short = [comp for comp in comp_order]
-            ax_left.set_xticklabels(labels_clean_short, rotation=35, ha='right', fontsize=10, color='k')
-
-            # Axis limits
-            try:
-                max_f = max([v for v in (ab_fires + base_fires_arr) if not (_np.isnan(v))], default=2.0)
-                ax_left.set_ylim(0, max(2.0, max_f * 1.15))
-            except Exception:
-                ax_left.set_ylim(0, 2.0)
-            try:
-                max_b = max([v for v in (ab_boxes + base_boxes_arr) if not (_np.isnan(v))], default=100.0)
-                ax_right.set_ylim(0, max(100.0, max_b * 1.05))
-            except Exception:
-                ax_right.set_ylim(0, 100.0)
-
-            # Spines black
+            
+            n_modes = len(labels)
+            bar_width = 0.35
+            x_pos = _np.arange(n_modes)
+            
+            # Position bars: fires at x - bar_width/2, boxes at x + bar_width/2
+            fires_positions = x_pos - bar_width / 2
+            boxes_positions = x_pos + bar_width / 2
+            
+            # Plot fires (red) on left axis with error bars
+            ax_left.bar(fires_positions, fires_means, bar_width, color='#d62728', 
+                       edgecolor='k', linewidth=0.8, alpha=0.9,
+                       yerr=fires_stds, capsize=4, error_kw={'elinewidth': 1.5, 'capthick': 1.5})
+            
+            # Plot boxes (green) on right axis with error bars
+            ax_right.bar(boxes_positions, boxes_means, bar_width, color='#2ca02c',
+                        edgecolor='k', linewidth=0.8, alpha=0.9,
+                        yerr=boxes_stds, capsize=4, error_kw={'elinewidth': 1.5, 'capthick': 1.5})
+            
+            # Axis labels and formatting
+            ax_left.set_ylabel('Fires Viewed', fontsize=11, color='k')
+            ax_right.set_ylabel('Boxes Explored', fontsize=11, color='k')
+            ax_left.tick_params(axis='y', labelcolor='k', labelsize=10)
+            ax_right.tick_params(axis='y', labelcolor='k', labelsize=10)
+            
+            ax_left.set_xticks(x_pos)
+            ax_left.set_xticklabels(labels, rotation=35, ha='right', fontsize=10)
+            
+            # Set y-axis limits
+            max_fires = max(fires_means) if fires_means else 10
+            max_boxes = max(boxes_means) if boxes_means else 100
+            ax_left.set_ylim(0, max_fires * 1.15)
+            ax_right.set_ylim(0, max_boxes * 1.05)
+            
+            # Styling
             for spine in ax_left.spines.values():
                 spine.set_edgecolor('k')
             for spine in ax_right.spines.values():
                 spine.set_edgecolor('k')
-
-            # Legend
-            from matplotlib.patches import Patch
-            legend_handles = [Patch(facecolor='#2ca02c', label='Fires Viewed'), Patch(facecolor='#d62728', label='Boxes Explored')]
-            ax_left.legend(handles=legend_handles, loc='upper left', frameon=True, edgecolor='k', fontsize=11)
-
-            fig.subplots_adjust(bottom=0.22, left=0.08, right=0.92, top=0.95)
+            
+            fig.tight_layout()
             outp = plots_dir / f'ablation_summary_s{ablation_scenario}_e{episodes_per_mode}.png'
-            fig.savefig(outp, dpi=200)
+            fig.savefig(outp, dpi=100)
             print(f"Saved ablation summary plot to {outp}")
         except Exception as e:
             print("Failed to produce ablation summary plot:", e)
+            import traceback
+            traceback.print_exc()
         # After ablation sweep is complete, exit main (avoid running full interactive training)
         return
     # Debug: show configured number of episodes per curriculum level
@@ -1962,9 +2004,7 @@ def main():
     # NOTE: agents will be created per-scenario so each scenario trains its own policy
     # Per-component normalizer will also be created per-scenario inside the scenario loop
 
-    # Prepare logs directory and CSV files (overwrite existing logs for a fresh run)
-    logs_dir = Path("logs")
-    logs_dir.mkdir(exist_ok=True)
+    # Prepare CSV files (logs_dir already created earlier)
     training_csv_path = logs_dir / "training_metrics.csv"
     steps_csv_path = logs_dir / "steps.csv"
     # Open and write headers
@@ -1975,7 +2015,8 @@ def main():
     steps_fp = open(steps_csv_path, 'w', newline='')
     steps_writer = csv.writer(steps_fp)
     # Add per-step components: exploration_reward, proximity_reward and per-step td_error
-    steps_writer.writerow(["episode", "step", "x", "y", "z", "action0", "action1", "action2", "reward", "exploration_reward", "proximity_reward", "energy", "exploration_norm", "proximity_norm", "energy_norm", "normalized_reward", "td_error", "action_saturation", "rule_override"])
+    # Now includes drone_id to log both drones' trajectories
+    steps_writer.writerow(["episode", "step", "drone_id", "x", "y", "z", "action0", "action1", "action2", "reward", "exploration_reward", "proximity_reward", "energy", "exploration_norm", "proximity_norm", "energy_norm", "normalized_reward", "td_error", "action_saturation", "rule_override"])
 
     # Per-update diagnostics (agent training updates)
     updates_csv_path = logs_dir / "updates.csv"
@@ -2074,7 +2115,11 @@ def main():
             safety_margin=env.safety_margin,
             max_step_size=env.max_step_size,
             obs_dim=obs_dim,
-            act_dim=act_dim
+            act_dim=act_dim,
+            x_max=env.x_max,
+            y_max=env.y_max,
+            z_min=env.z_min,
+            z_max=env.z_max
         ) for _ in range(env.n_drones)]
         # Per-component normalizer for logging and optional normalization (per-scenario)
         reward_normalizer = RewardNormalizer(warmup=N_WARMUP_TRANSITIONS, clip=3.0)
@@ -2119,8 +2164,9 @@ def main():
                     obs, _ = env.reset()
                     # After reset, override starts/fires per scenario-section rules
                     # Default fixed start points (user-specified)
-                    fixed_start_1 = np.array([10.0, 10.0, 10.0])
-                    fixed_start_2 = np.array([0.0, 0.0, 10.0])
+                    # Drone 1 at x=20, Drone 2 at x=0, both with random y and z
+                    fixed_start_1 = np.array([20.0, np.random.uniform(0.5, env.y_max - 0.5), np.random.uniform(5, 10)])
+                    fixed_start_2 = np.array([0.0, np.random.uniform(0.5, env.y_max - 0.5), np.random.uniform(5, 10)])
                     # SECTION overrides
                     if scenario == 1:
                         if section == 1:
@@ -2134,8 +2180,8 @@ def main():
                                 dy = rad * np.sin(theta)
                                 dz = np.random.uniform(-0.5, 0.5)
                                 np_pt = pt + np.array([dx, dy, dz])
-                                np_pt[0] = np.clip(np_pt[0], 0, env.area_size)
-                                np_pt[1] = np.clip(np_pt[1], 0, env.area_size)
+                                np_pt[0] = np.clip(np_pt[0], 0, env.x_max)
+                                np_pt[1] = np.clip(np_pt[1], 0, env.y_max)
                                 np_pt[2] = np.clip(np_pt[2], 5, 10)
                                 return np_pt
                             env.drone_pos = np.stack([jitter_around(fixed_start_1), jitter_around(fixed_start_2)])
@@ -2143,8 +2189,8 @@ def main():
                     elif scenario == 4:
                         if section == 1:
                             env.drone_pos = np.stack([fixed_start_1, fixed_start_2])
-                            # fixed fires at provided coordinates (z set to 7.5)
-                            env.fire_centers = [np.array([5.0,5.0,7.5]), np.array([2.0,2.0,7.5]), np.array([8.0,8.0,7.5]), np.array([2.0,8.0,7.5]), np.array([8.0,2.0,7.5])]
+                            # fixed fires at provided coordinates
+                            env.fire_centers = [np.array([10.0,5.0,5.0]), np.array([12.0,3.0,5.0]), np.array([8.0,6.0,5.0]), np.array([12.0,6.0,5.0]), np.array([8.0,3.0,5.0])]
                         else:
                             env.drone_pos = np.stack([fixed_start_1, fixed_start_2])
                             # 5 randomly placed fires not on drone start points
@@ -2152,8 +2198,8 @@ def main():
                             tries = 0
                             while len(env.fire_centers) < 5 and tries < 200:
                                 tries += 1
-                                x = np.random.uniform(1, env.area_size-1)
-                                y = np.random.uniform(1, env.area_size-1)
+                                x = np.random.uniform(1, env.x_max-1)
+                                y = np.random.uniform(1, env.y_max-1)
                                 z = np.random.uniform(5, 10)
                                 pt = np.array([x,y,z])
                                 if np.min([np.linalg.norm(pt - dp) for dp in env.drone_pos]) > 1.0:
@@ -2167,7 +2213,7 @@ def main():
                             tries = 0
                             while len(env.drone_pos) < env.n_drones and tries < 200:
                                 tries += 1
-                                pt = np.array([np.random.uniform(0.5, env.area_size-0.5), np.random.uniform(0.5, env.area_size-0.5), np.random.uniform(5,10)])
+                                pt = np.array([np.random.uniform(0.5, env.x_max-0.5), np.random.uniform(0.5, env.y_max-0.5), np.random.uniform(5,10)])
                                 if env.fire_centers:
                                     if np.min([np.linalg.norm(pt - fc) for fc in env.fire_centers]) > 1.0:
                                         env.drone_pos.append(pt)
@@ -2178,13 +2224,13 @@ def main():
                         # Section 1: deterministic timed fire spawns at specific coords
                         env.drone_pos = np.stack([fixed_start_2, fixed_start_1])
                         if section == 1:
-                            # start with the first fire at (5,5)
-                            env.fire_centers = [np.array([5.0,5.0,7.5])]
+                            # start with the first fire at (10,5,5)
+                            env.fire_centers = [np.array([10.0,5.0,5.0])]
                             # Prepare a schedule for subsequent fires
                             env._scheduled_spawns = [(20, np.array([2.0,2.0,7.5])), (40, np.array([8.0,8.0,7.5])), (60, np.array([2.0,8.0,7.5])), (80, np.array([8.0,2.0,7.5]))]
                         else:
-                            # Section 2: start with a fire at (5,5) and then spawn a random fire every 30 steps
-                            env.fire_centers = [np.array([5.0,5.0,7.5])]
+                            # Section 2: start with a fire at (10,5,5) and then spawn a random fire every 30 steps
+                            env.fire_centers = [np.array([10.0,5.0,5.0])]
                             env._scheduled_spawns = []
                     elif scenario == 5 or scenario == 6:
                         if section == 1:
@@ -2194,7 +2240,7 @@ def main():
                             tries = 0
                             while len(env.drone_pos) < env.n_drones and tries < 200:
                                 tries += 1
-                                pt = np.array([np.random.uniform(0.5, env.area_size-0.5), np.random.uniform(0.5, env.area_size-0.5), np.random.uniform(5,10)])
+                                pt = np.array([np.random.uniform(0.5, env.x_max-0.5), np.random.uniform(0.5, env.y_max-0.5), np.random.uniform(5,10)])
                                 # ensure not on any fire (if present)
                                 good = True
                                 if hasattr(env, 'fire_centers') and env.fire_centers:
@@ -2617,14 +2663,15 @@ def main():
                                 else:
                                     norm_expl_mean = norm_prox_mean = norm_energy_mean = float('nan')
 
-                    # Count fires discovered this episode (drone 0 used as representative; sum unique discoveries across drones)
-                    # Count fires discovered this episode defensively
+                    # Count fires discovered this episode (unique fires union across drones)
                     fv = getattr(env, 'fires_visited', None)
                     if fv is None:
                         fires_discovered = 0
                     else:
                         try:
-                            fires_discovered = sum(len(s) for s in fv)
+                            # Count unique fires discovered (union across drones) rather than per-drone sum
+                            all_fires = set().union(*fv)
+                            fires_discovered = len(all_fires)
                         except Exception:
                             fires_discovered = 0
                     # Record per-episode fires viewed
@@ -2655,55 +2702,57 @@ def main():
                     target_q_mean_log = float(getattr(agents[0], 'last_target_q_mean', float('nan'))) if agents and len(agents) > 0 else float('nan')
                     training_writer.writerow([global_episode_counter, mean_total, int(steps), success, int(collisions), float(avg_goal_dist), ";".join([str(ct) for ct in crash_type]), prox_comp, expl_comp, energy_comp, int(fires_discovered), norm_total, norm_prox_mean, norm_expl_mean, norm_energy_mean, action_saturation_fraction, actor_loss_log, actor_loss_raw_log, actor_q_mean_log, target_q_mean_log, critic_loss_log, td_error_log, int(episode_fires_viewed[-1]) if episode_fires_viewed else 0, int(episode_boxes_explored[-1]) if episode_boxes_explored else 0])
 
-                    # Write per-step rows (log only drone 0 for compactness)
+                    # Write per-step rows for both drones
                     # When writing per-step rows, attempt to split reward into components if possible.
                     for t in range(len(episode_states)):
-                        st = episode_states[t][0]
-                        act = episode_actions[t][0] if t < len(episode_actions) else np.array([0.0, 0.0, 0.0])
-                        reward_step = episode_rewards_per_step[t][0] if t < len(episode_rewards_per_step) else 0.0
-                        # Try to estimate exploration vs proximity component if we recorded seen grids or computed them
-                        exploration_comp = float('nan')
-                        proximity_comp = float('nan')
-                        # If env provided a breakdown in episode_rewards_per_step as tuples, handle that
-                        # Some code paths may have stored a tuple (prox, expl)
-                        if t < len(episode_rewards_per_step) and isinstance(episode_rewards_per_step[t][0], (list, tuple)) and len(episode_rewards_per_step[t][0]) >= 2:
-                            try:
-                                proximity_comp = float(episode_rewards_per_step[t][0][0])
-                            except Exception:
-                                proximity_comp = float('nan')
-                            try:
-                                exploration_comp = float(episode_rewards_per_step[t][0][1])
-                            except Exception:
-                                exploration_comp = float('nan')
+                        # Log both drones
+                        for drone_idx in range(env.n_drones):
+                            st = episode_states[t][drone_idx]
+                            act = episode_actions[t][drone_idx] if t < len(episode_actions) else np.array([0.0, 0.0, 0.0])
+                            reward_step = episode_rewards_per_step[t][drone_idx] if t < len(episode_rewards_per_step) else 0.0
+                            # Try to estimate exploration vs proximity component if we recorded seen grids or computed them
+                            exploration_comp = float('nan')
+                            proximity_comp = float('nan')
+                            # If env provided a breakdown in episode_rewards_per_step as tuples, handle that
+                            # Some code paths may have stored a tuple (prox, expl)
+                            if t < len(episode_rewards_per_step) and isinstance(episode_rewards_per_step[t][drone_idx], (list, tuple)) and len(episode_rewards_per_step[t][drone_idx]) >= 2:
+                                try:
+                                    proximity_comp = float(episode_rewards_per_step[t][drone_idx][0])
+                                except Exception:
+                                    proximity_comp = float('nan')
+                                try:
+                                    exploration_comp = float(episode_rewards_per_step[t][drone_idx][1])
+                                except Exception:
+                                    exploration_comp = float('nan')
 
-                        # As a safety, clamp the recorded per-step reward to a reasonable range to avoid huge episode sums
-                        reward_step_clamped = float(np.clip(reward_step, -REWARD_CLIP, REWARD_CLIP))
-                        # Fill td_error column from agent diagnostics if available (use agent 0 as representative)
-                        td_error_val = float('nan')
-                        if agents and len(agents) > 0:
-                            td_error_val = agents[0].last_td_error if hasattr(agents[0], 'last_td_error') else float('nan')
-                        else:
+                            # As a safety, clamp the recorded per-step reward to a reasonable range to avoid huge episode sums
+                            reward_step_clamped = float(np.clip(reward_step, -REWARD_CLIP, REWARD_CLIP))
+                            # Fill td_error column from agent diagnostics if available
                             td_error_val = float('nan')
-                        # extract per-step energy component if env provided it in episode arrays (info not stored per-step by default)
-                        energy_val = float('nan')
-                        # compute action_saturation metric for this step (fraction of action dims near ±1)
-                        try:
-                            action_saturation = float(np.mean(np.abs(np.asarray(act)) > 0.98))
-                        except Exception:
-                            action_saturation = float('nan')
-                        # Pull per-step normalized components if available
-                        expl_norm = prox_norm = energy_norm = norm_reward_step = float('nan')
-                        if 'episode_normalized_components' in locals() and t < len(episode_normalized_components[0]):
+                            if agents and len(agents) > drone_idx:
+                                td_error_val = agents[drone_idx].last_td_error if hasattr(agents[drone_idx], 'last_td_error') else float('nan')
+                            else:
+                                td_error_val = float('nan')
+                            # extract per-step energy component if env provided it in episode arrays (info not stored per-step by default)
+                            energy_val = float('nan')
+                            # compute action_saturation metric for this step (fraction of action dims near ±1)
                             try:
-                                en = episode_normalized_components[0][t]
-                                expl_norm = float(en[0])
-                                prox_norm = float(en[1])
-                                energy_norm = float(en[2])
-                                norm_reward_step = float(en[3])
+                                action_saturation = float(np.mean(np.abs(np.asarray(act)) > 0.98))
                             except Exception:
-                                expl_norm = prox_norm = energy_norm = norm_reward_step = float('nan')
+                                action_saturation = float('nan')
+                            # Pull per-step normalized components if available
+                            expl_norm = prox_norm = energy_norm = norm_reward_step = float('nan')
+                            if 'episode_normalized_components' in locals() and t < len(episode_normalized_components[drone_idx]):
+                                try:
+                                    en = episode_normalized_components[drone_idx][t]
+                                    expl_norm = float(en[0])
+                                    prox_norm = float(en[1])
+                                    energy_norm = float(en[2])
+                                    norm_reward_step = float(en[3])
+                                except Exception:
+                                    expl_norm = prox_norm = energy_norm = norm_reward_step = float('nan')
 
-                        steps_writer.writerow([global_episode_counter, t, float(st[0]), float(st[1]), float(st[2]), float(act[0]), float(act[1]), float(act[2]), reward_step_clamped, exploration_comp, proximity_comp, energy_val, expl_norm, prox_norm, energy_norm, norm_reward_step, td_error_val, action_saturation, 0])
+                            steps_writer.writerow([global_episode_counter, t, drone_idx, float(st[0]), float(st[1]), float(st[2]), float(act[0]), float(act[1]), float(act[2]), reward_step_clamped, exploration_comp, proximity_comp, energy_val, expl_norm, prox_norm, energy_norm, norm_reward_step, td_error_val, action_saturation, 0])
 
                     # Human-friendly episode summary
                     end_msgs = []
@@ -2964,7 +3013,7 @@ def main():
                     _plt.xlabel('Episode')
                     _plt.legend(loc='upper left')
                 try:
-                    _plt.savefig(out_path, dpi=200)
+                    _plt.savefig(out_path, dpi=1000)
                     print(f"Saved analysis plot to {out_path}")
                 except Exception:
                     print("Failed to save analysis plot")
@@ -3039,7 +3088,7 @@ def main():
     stats_fname = plots_dir / 'stats_summary.png'
     if hasattr(plt, 'savefig'):
         plt.tight_layout()
-        plt.savefig(stats_fname, dpi=500)
+        plt.savefig(stats_fname, dpi=1000)
         print(f"Saved stats summary to {stats_fname}")
     else:
         plt.show()
@@ -3057,8 +3106,8 @@ def main():
             else:
                 circle = plt.Circle((x, y), r, color=colors[i], alpha=0.1)
             ax.add_patch(circle)
-    plt.xlim(0, env.area_size)
-    plt.ylim(0, env.area_size)
+    plt.xlim(0, env.x_max)
+    plt.ylim(0, env.y_max)
     plt.gca().set_aspect('equal', adjustable='box')
     plt.title('Union of All Seen Areas (Last Episode)')
     plt.xlabel('X')
@@ -3067,7 +3116,7 @@ def main():
     # Save union plot
     if hasattr(plt, 'savefig'):
         union_fname = plots_dir / 'union_seen_areas.png'
-        plt.savefig(union_fname, dpi=500)
+        plt.savefig(union_fname, dpi=1000)
         print(f"Saved union of seen areas to {union_fname}")
     else:
         plt.show()
@@ -3084,14 +3133,15 @@ def main():
         if exp_vmin == exp_vmax:
             exp_vmin = 0.0
             exp_vmax = max(1.0, abs(exp_vmax))
-        im = ax_exp.imshow(env.cell_rewards.T, origin='lower', cmap='YlOrRd', vmin=exp_vmin, vmax=exp_vmax)
+        # Map grid coordinates to world coordinates: grid goes from 0 to x_max/y_max
+        im = ax_exp.imshow(env.cell_rewards.T, origin='lower', cmap='YlOrRd', vmin=exp_vmin, vmax=exp_vmax, extent=[0, env.x_max, 0, env.y_max])
         ax_exp.set_title('Exploration Reward Table (cell_rewards)')
-        ax_exp.set_xlabel('Grid X')
-        ax_exp.set_ylabel('Grid Y')
+        ax_exp.set_xlabel('X Position')
+        ax_exp.set_ylabel('Y Position')
         fig_exp.colorbar(im, ax=ax_exp, label='Cell Reward Value')
         fig_exp.tight_layout()
         exp_fname = plots_dir / 'exploration_reward_table.png'
-        fig_exp.savefig(exp_fname, dpi=500)
+        fig_exp.savefig(exp_fname, dpi=1000)
         plt.close(fig_exp)
         print(f"Saved exploration reward table to {exp_fname}")
     else:
@@ -3167,16 +3217,17 @@ def main():
         if int_vmin == int_vmax:
             int_vmin = -1.0
             int_vmax = 1.0
-        fig_int = plt.figure(figsize=(6, 5))
+        fig_int = plt.figure(figsize=(7, 5))
         ax_int = fig_int.add_subplot(111)
-        im2 = ax_int.imshow(integrated_reward.T, origin='lower', cmap='bwr', vmin=int_vmin, vmax=int_vmax)
+        # Map grid coordinates to world coordinates: [0, x_max] and [0, y_max]
+        im2 = ax_int.imshow(integrated_reward.T, origin='lower', cmap='bwr', vmin=int_vmin, vmax=int_vmax, extent=[0, env.x_max, 0, env.y_max])
         ax_int.set_title('Integrated Reward System Heatmap (Last Episode)')
-        ax_int.set_xlabel('Grid X')
-        ax_int.set_ylabel('Grid Y')
+        ax_int.set_xlabel('X Position')
+        ax_int.set_ylabel('Y Position')
         fig_int.colorbar(im2, ax=ax_int, label='Total Reward Value')
         fig_int.tight_layout()
         int_fname = plots_dir / 'integrated_reward_heatmap.png'
-        fig_int.savefig(int_fname, dpi=500)
+        fig_int.savefig(int_fname, dpi=1000)
         plt.close(fig_int)
         print(f"Saved integrated reward heatmap to {int_fname}")
     else:
@@ -3302,7 +3353,7 @@ if __name__ == "__main__":
         def smoke_run(episodes=10):
             env = DroneEnv(scenario=1)
             obs, _ = env.reset()
-            agents = [TD3Agent(env.area_size, env.drone_radius, env.fire_line, env.fire_radius, env.safety_margin, env.max_step_size, obs_dim=env.observation_space.shape[1], act_dim=env.action_space.shape[1]) for _ in range(env.n_drones)]
+            agents = [TD3Agent(env.area_size, env.drone_radius, env.fire_line, env.fire_radius, env.safety_margin, env.max_step_size, obs_dim=env.observation_space.shape[1], act_dim=env.action_space.shape[1], x_max=env.x_max, y_max=env.y_max, z_min=env.z_min, z_max=env.z_max) for _ in range(env.n_drones)]
             for ep in range(episodes):
                 obs, _ = env.reset()
                 done = [False] * env.n_drones
