@@ -82,7 +82,7 @@ def load_or_synthesize():
 def save_fig(fig, name):
     path = OUT_DIR / name
     fig.tight_layout()
-    fig.savefig(path, dpi=500)
+    fig.savefig(path, dpi=1000)
     plt.close(fig)
     print(f"Saved {path}")
 
@@ -175,34 +175,74 @@ def plot_td_error_hist(df_steps):
 
 
 def plot_state_visitation(df_steps):
-    fig, ax = plt.subplots(figsize=(6, 6))
-    hb = ax.hexbin(df_steps['x'], df_steps['y'], gridsize=80, cmap='inferno')
+    fig, ax = plt.subplots(figsize=(7, 5))
+    hb = ax.hexbin(df_steps['x'], df_steps['y'], gridsize=80, cmap='inferno', extent=[0, 20, 0, 10])
     fig.colorbar(hb, ax=ax, label='visitation count')
     #ax.set_title('State visitation heatmap (x,y)')
+    ax.set_xlim(0, 20)
+    ax.set_ylim(0, 10)
     ax.set_xlabel('x')
     ax.set_ylabel('y')
+    ax.set_aspect('equal', adjustable='box')
     save_fig(fig, 'state_visitation.png')
 
 
 def plot_trajectories(df_steps):
-    # Plot sample trajectories for first N episodes
-    sample_eps = sorted(df_steps['episode'].unique())[:20]
-    fig, ax = plt.subplots(figsize=(6, 6))
+    # Plot 10 trajectories evenly distributed throughout training
+    # Now handles drone_id column to plot both drone 0 and drone 1 separately
+    all_eps = sorted(df_steps['episode'].unique())
+    n_episodes = len(all_eps)
+    
+    if n_episodes <= 5:
+        # If we have 10 or fewer episodes, plot all of them
+        sample_eps = all_eps
+    else:
+        # Select 10 episodes evenly distributed
+        indices = np.linspace(0, n_episodes - 1, 10, dtype=int)
+        sample_eps = [all_eps[i] for i in indices]
+    
+    fig, ax = plt.subplots(figsize=(7, 5))
+    
+    # Check if drone_id column exists
+    has_drone_id = 'drone_id' in df_steps.columns
+    
     for ep in sample_eps:
         g = df_steps[df_steps['episode'] == ep].reset_index(drop=True)
-        # Create a colormap from light red to deep red over the trajectory length
-        n = len(g)
-        if n < 2:
-            continue
-        cmap = plt.get_cmap('Reds')
-        # Map steps [0..n-1] to [0.25..1.0] on the colormap so start is lighter
-        vals = np.linspace(0.25, 1.0, n)
-        for i in range(n-1):
-            c = cmap(vals[i])
-            ax.plot([g.loc[i, 'x'], g.loc[i+1, 'x']], [g.loc[i, 'y'], g.loc[i+1, 'y']], color=c, linewidth=1.2)
+        
+        if has_drone_id:
+            # Plot trajectories for both drones with different colors
+            for drone_id in [0, 1]:
+                drone_data = g[g['drone_id'] == drone_id].reset_index(drop=True)
+                if len(drone_data) < 2:
+                    continue
+                # Create a colormap: drone 0 uses Blues, drone 1 uses Oranges
+                cmap = plt.get_cmap('Blues' if drone_id == 0 else 'Oranges')
+                n = len(drone_data)
+                # Map steps [0..n-1] to [0.25..1.0] on the colormap so start is lighter
+                vals = np.linspace(0.25, 1.0, n)
+                for i in range(n-1):
+                    c = cmap(vals[i])
+                    ax.plot([drone_data.loc[i, 'x'], drone_data.loc[i+1, 'x']], 
+                           [drone_data.loc[i, 'y'], drone_data.loc[i+1, 'y']], 
+                           color=c, linewidth=1.2)
+        else:
+            # Fallback for legacy data without drone_id column
+            n = len(g)
+            if n < 2:
+                continue
+            cmap = plt.get_cmap('Reds')
+            # Map steps [0..n-1] to [0.25..1.0] on the colormap so start is lighter
+            vals = np.linspace(0.25, 1.0, n)
+            for i in range(n-1):
+                c = cmap(vals[i])
+                ax.plot([g.loc[i, 'x'], g.loc[i+1, 'x']], [g.loc[i, 'y'], g.loc[i+1, 'y']], color=c, linewidth=1.2)
+    
     #ax.set_title('Trajectories (x,y)')
+    ax.set_xlim(0, 20)
+    ax.set_ylim(0, 10)
     ax.set_xlabel('x')
     ax.set_ylabel('y')
+    ax.set_aspect('equal', adjustable='box')
     save_fig(fig, 'trajectories.png')
 
 
@@ -248,8 +288,9 @@ def plot_q_value_heatmap(df_steps):
     # synthesize a Q surface by binning x and y and averaging a synthetic q-value
     df = df_steps.copy()
     df['q'] = - (df['x']**2 + df['y']**2) * 0.1 + np.random.randn(len(df)) * 0.5
-    xedges = np.linspace(df['x'].quantile(0.01), df['x'].quantile(0.99), 60)
-    yedges = np.linspace(df['y'].quantile(0.01), df['y'].quantile(0.99), 60)
+    # Use full map boundaries: x [0,20], y [0,10]
+    xedges = np.linspace(0, 20, 60)
+    yedges = np.linspace(0, 10, 60)
     qgrid = np.zeros((len(xedges)-1, len(yedges)-1))
     counts = np.zeros_like(qgrid)
     for i in range(len(xedges)-1):
@@ -262,18 +303,21 @@ def plot_q_value_heatmap(df_steps):
             else:
                 qgrid[i, j] = np.nan
 
-    fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(np.nan_to_num(qgrid.T), origin='lower', aspect='auto', cmap='coolwarm')
+    fig, ax = plt.subplots(figsize=(7, 5))
+    im = ax.imshow(np.nan_to_num(qgrid.T), origin='lower', extent=[0, 20, 0, 10], aspect='auto', cmap='coolwarm')
     fig.colorbar(im, ax=ax, label='Q value (approx)')
     #ax.set_title('Approximate Q-value heatmap (binned x,y)')
+    ax.set_xlabel('x')
+    ax.set_ylabel('y')
     save_fig(fig, 'q_value_heatmap.png')
 
 def plot_decision_region(df_steps):
     # coarse grid showing most-frequent discretized action sign
     df = df_steps.copy()
     df['ax_sign'] = np.sign(df['action0']).astype(int)
-    xbins = np.linspace(df['x'].quantile(0.02), df['x'].quantile(0.98), 40)
-    ybins = np.linspace(df['y'].quantile(0.02), df['y'].quantile(0.98), 40)
+    # Use full map boundaries: x [0,20], y [0,10]
+    xbins = np.linspace(0, 20, 40)
+    ybins = np.linspace(0, 10, 40)
     grid = np.zeros((len(xbins)-1, len(ybins)-1))
     for i in range(len(xbins)-1):
         for j in range(len(ybins)-1):
@@ -284,11 +328,12 @@ def plot_decision_region(df_steps):
             else:
                 grid[i, j] = 0
 
-    fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(grid.T, origin='lower', cmap='coolwarm', extent=[xbins[0], xbins[-1], ybins[0], ybins[-1]])
+    fig, ax = plt.subplots(figsize=(7, 5))
+    im = ax.imshow(grid.T, origin='lower', cmap='coolwarm', extent=[0, 20, 0, 10])
     #ax.set_title('Decision region (sign of action0)')
     ax.set_xlabel('x')
     ax.set_ylabel('y')
+    ax.set_aspect('equal', adjustable='box')
     save_fig(fig, 'decision_region.png')
 
 
