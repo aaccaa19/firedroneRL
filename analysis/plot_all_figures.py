@@ -16,7 +16,13 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+from matplotlib.colors import LogNorm
 import os
+try:
+    from scipy.ndimage import gaussian_filter
+    _HAS_SCIPY = True
+except Exception:
+    _HAS_SCIPY = False
 
 OUT_DIR = Path("outputs/plots")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -82,18 +88,28 @@ def load_or_synthesize():
 def save_fig(fig, name):
     path = OUT_DIR / name
     fig.tight_layout()
-    fig.savefig(path, dpi=1000)
+    fig.savefig(path, dpi=200)
     plt.close(fig)
     print(f"Saved {path}")
 
 
 def plot_training_curve(df_train):
     fig, ax = plt.subplots(figsize=(9, 4))
-    ax.plot(df_train['episode'], df_train['total_reward'], color='C0', alpha=0.25, label='raw')
-    ax.plot(df_train['episode'], df_train['total_reward'].rolling(50, min_periods=1).mean(), color='C1', label='rolling(50)')
+    raw = df_train['total_reward']
+    roll = raw.rolling(50, min_periods=1).mean()
+    ax.plot(df_train['episode'], raw, color='C0', alpha=0.2, label='raw')
+    ax.plot(df_train['episode'], roll, color='C1', label='rolling(50)')
+    # highlight best rolling episode
+    if not roll.dropna().empty:
+        best_idx = int(roll.idxmax())
+        if best_idx > 0:
+            ax.axvline(best_idx, color='C2', linestyle='--', alpha=0.7)
+            try:
+                ax.annotate('best (rolling)', xy=(best_idx, roll.loc[best_idx]), xytext=(best_idx+5, roll.loc[best_idx]), color='C2')
+            except Exception:
+                pass
     ax.set_xlabel('Episode')
     ax.set_ylabel('Total Reward')
-    #ax.set_title('Training curve: total reward per episode')
     ax.legend()
     save_fig(fig, 'training_curve.png')
 
@@ -101,10 +117,25 @@ def plot_training_curve(df_train):
 def plot_avg_fire_distance(df_train):
     fig, ax = plt.subplots(figsize=(9, 4))
     if 'avg_goal_dist' in df_train.columns:
-        ax.plot(df_train['episode'], df_train['avg_goal_dist'], color='C2', alpha=0.6)
-        ax.plot(df_train['episode'], df_train['avg_goal_dist'].rolling(50, min_periods=1).mean(), color='C3', label='rolling(50)')
+        raw = df_train['avg_goal_dist']
+        roll = raw.rolling(50, min_periods=1).mean()
+        roll_std = raw.rolling(50, min_periods=1).std().fillna(0)
+        ax.plot(df_train['episode'], raw, color='C2', alpha=0.25, label='raw')
+        ax.plot(df_train['episode'], roll, color='C3', label='rolling(50)')
+        ax.fill_between(df_train['episode'], roll - roll_std, roll + roll_std, color='C3', alpha=0.15)
         ax.set_ylabel('Average Distance to Fire')
-        #ax.set_title('Average Fire Distance per Episode')
+        # detect mid-training rise: if rolling mean increases by > 0.5 over a 50-episode window
+        if len(roll) > 60:
+            delta = roll.diff(50)
+            rises = delta[delta > 0.5]
+            if not rises.empty:
+                idx = int(rises.index[0])
+                ep_idx = df_train.loc[idx, 'episode'] if 'episode' in df_train.columns else idx
+                ax.axvline(ep_idx, color='C4', linestyle=':', alpha=0.7)
+                try:
+                    ax.annotate('observed rise', xy=(ep_idx, roll.loc[idx]), xytext=(ep_idx+5, roll.loc[idx]+0.5), color='C4')
+                except Exception:
+                    pass
     else:
         ax.text(0.5, 0.5, 'avg_goal_dist not available in logs', ha='center', va='center')
     ax.set_xlabel('Episode')
@@ -113,17 +144,25 @@ def plot_avg_fire_distance(df_train):
 
 def plot_length_and_success(df_train):
     fig, axs = plt.subplots(1, 2, figsize=(12, 4))
-    axs[0].plot(df_train['episode'], df_train['length'], alpha=0.4)
-    #axs[0].set_title('Episode length')
-    axs[0].set_xlabel('Episode')
-    axs[0].set_ylabel('Length (steps)')
-
+    # Plot moving averages for both length and success so metrics are comparable
     window = 50
-    success_rate = df_train['success'].rolling(window, min_periods=1).mean()
-    axs[1].plot(df_train['episode'], success_rate)
-    #axs[1].set_title(f'Success rate (rolling {window})')
+    # Length moving average: use precomputed 'length_ma' if present, else rolling
+    if 'length_ma' in df_train.columns:
+        length_ma = df_train['length_ma']
+    else:
+        length_ma = df_train['length'].rolling(window, min_periods=1).mean()
+    axs[0].plot(df_train['episode'], length_ma, color='C0')
+    axs[0].set_xlabel('Episode')
+    axs[0].set_ylabel('Length (steps, moving avg)')
+
+    # Success moving average: use precomputed 'success_ma' if present, else rolling
+    if 'success_ma' in df_train.columns:
+        success_ma = df_train['success_ma']
+    else:
+        success_ma = df_train['success'].rolling(window, min_periods=1).mean()
+    axs[1].plot(df_train['episode'], success_ma, color='C1')
     axs[1].set_xlabel('Episode')
-    axs[1].set_ylabel('Success rate')
+    axs[1].set_ylabel(f'Success rate (rolling {window})')
     save_fig(fig, 'length_and_success.png')
 
 
@@ -144,28 +183,51 @@ def plot_losses(df_train):
         actor = np.abs(np.random.randn(n) * (1.0 - np.linspace(0, 0.9, n)))
         critic = np.abs(np.random.randn(n) * (1.2 - np.linspace(0, 0.9, n)))
 
-    # Create two separate plots: one for actor, one for critic
-    fig1, ax1 = plt.subplots(figsize=(9, 4))
-    ax1.plot(df_train['episode'], actor, label='actor_loss', color='C0')
-    ax1.set_yscale('log')
-    ax1.set_xlabel('Episode')
-    ax1.set_ylabel('Actor Loss (log scale)')
-    #ax1.set_title('Actor loss curve')
-    save_fig(fig1, 'actor_loss.png')
+    # Create two separate plots: one for actor, one for critic with improved visualization
+    def plot_loss_series(series, name, color):
+        eps = df_train['episode']
+        # clip extreme outliers for plotting clarity (0.5-99.5 percentile)
+        lo, hi = np.nanpercentile(series, [0.5, 99.5])
+        clipped = np.clip(series, lo, hi)
+        roll = pd.Series(clipped).rolling(25, min_periods=1).median()
 
-    fig2, ax2 = plt.subplots(figsize=(9, 4))
-    ax2.plot(df_train['episode'], critic, label='critic_loss', color='C1')
-    ax2.set_yscale('log')
-    ax2.set_xlabel('Episode')
-    ax2.set_ylabel('Critic Loss (log scale)')
-    #ax2.set_title('Critic loss curve')
-    save_fig(fig2, 'critic_loss.png')
+        fig, ax = plt.subplots(figsize=(9, 4))
+        ax.plot(eps, clipped, color=color, alpha=0.25, label=f'{name} (clipped)')
+        ax.plot(eps, roll, color=color, linewidth=2, label=f'{name} median(25)')
+        ax.set_yscale('log')
+        ax.set_xlabel('Episode')
+        ax.set_ylabel(f'{name} (log scale)')
+
+        # also add a small linear-scale inset for absolute values interpretation
+        try:
+            axins = ax.inset_axes([0.62, 0.55, 0.35, 0.35])
+            axins.plot(eps, clipped, color=color, alpha=0.35)
+            axins.plot(eps, roll, color=color)
+            axins.set_yscale('linear')
+            axins.set_title('linear')
+        except Exception:
+            pass
+
+        save_fig(fig, f'{name.lower()}_loss.png')
+
+    plot_loss_series(actor, 'Actor_Loss', 'C0')
+    plot_loss_series(critic, 'Critic_Loss', 'C1')
 
 
 def plot_td_error_hist(df_steps):
     fig, ax = plt.subplots(figsize=(7, 4))
     if 'td_error' in df_steps.columns and not df_steps['td_error'].dropna().empty:
-        sns.histplot(df_steps['td_error'].dropna(), bins=80, kde=True, ax=ax)
+        td = df_steps['td_error'].dropna()
+        # clip extreme tails for visualization
+        hi = np.nanpercentile(td, 99.5)
+        lo = np.nanpercentile(td, 0.5)
+        td_clip = td.clip(lo, hi)
+        sns.histplot(td_clip, bins=80, kde=True, ax=ax, color='C0')
+        p10, p50, p90 = np.nanpercentile(td, [10, 50, 90])
+        for v in [p10, p50, p90]:
+            ax.axvline(v, color='k', linestyle='--', alpha=0.6)
+        mean = td.mean(); std = td.std()
+        ax.annotate(f'mean={mean:.3f}\nstd={std:.3f}', xy=(0.98, 0.95), xycoords='axes fraction', ha='right', va='top')
         #ax.set_title('TD-error distribution')
     else:
         ax.text(0.5, 0.5, 'No TD-error data available', ha='center', va='center')
@@ -176,8 +238,14 @@ def plot_td_error_hist(df_steps):
 
 def plot_state_visitation(df_steps):
     fig, ax = plt.subplots(figsize=(7, 5))
-    hb = ax.hexbin(df_steps['x'], df_steps['y'], gridsize=80, cmap='inferno', extent=[0, 20, 0, 10])
-    fig.colorbar(hb, ax=ax, label='visitation count')
+    x = df_steps['x']; y = df_steps['y']
+    # use log norm to highlight hotspots while keeping background visible
+    hb = ax.hexbin(x, y, gridsize=80, cmap='inferno', extent=[0, 20, 0, 10], mincnt=1, norm=LogNorm())
+    cbar = fig.colorbar(hb, ax=ax, label='visitation count (log)')
+    try:
+        cbar.formatter.set_scientific(False)
+    except Exception:
+        pass
     #ax.set_title('State visitation heatmap (x,y)')
     ax.set_xlim(0, 20)
     ax.set_ylim(0, 10)
@@ -222,9 +290,18 @@ def plot_trajectories(df_steps):
                 vals = np.linspace(0.25, 1.0, n)
                 for i in range(n-1):
                     c = cmap(vals[i])
-                    ax.plot([drone_data.loc[i, 'x'], drone_data.loc[i+1, 'x']], 
-                           [drone_data.loc[i, 'y'], drone_data.loc[i+1, 'y']], 
-                           color=c, linewidth=1.2)
+                    x0, x1 = drone_data.loc[i, 'x'], drone_data.loc[i+1, 'x']
+                    y0, y1 = drone_data.loc[i, 'y'], drone_data.loc[i+1, 'y']
+                    # lightweight segment plotting (helps later smoothing visually)
+                    ax.plot([x0, x1], [y0, y1], color=c, linewidth=1.2)
+                # final heading arrow
+                try:
+                    ax.arrow(drone_data.loc[n-2, 'x'], drone_data.loc[n-2, 'y'],
+                             drone_data.loc[n-1, 'x']-drone_data.loc[n-2, 'x'],
+                             drone_data.loc[n-1, 'y']-drone_data.loc[n-2, 'y'],
+                             head_width=0.08, head_length=0.12, fc=cmap(0.9), ec=cmap(0.9))
+                except Exception:
+                    pass
         else:
             # Fallback for legacy data without drone_id column
             n = len(g)
@@ -236,6 +313,10 @@ def plot_trajectories(df_steps):
             for i in range(n-1):
                 c = cmap(vals[i])
                 ax.plot([g.loc[i, 'x'], g.loc[i+1, 'x']], [g.loc[i, 'y'], g.loc[i+1, 'y']], color=c, linewidth=1.2)
+            try:
+                ax.arrow(g.loc[n-2, 'x'], g.loc[n-2, 'y'], g.loc[n-1, 'x']-g.loc[n-2, 'x'], g.loc[n-1, 'y']-g.loc[n-2, 'y'], head_width=0.08, head_length=0.12, fc=cmap(0.9), ec=cmap(0.9))
+            except Exception:
+                pass
     
     #ax.set_title('Trajectories (x,y)')
     ax.set_xlim(0, 20)
@@ -304,7 +385,15 @@ def plot_q_value_heatmap(df_steps):
                 qgrid[i, j] = np.nan
 
     fig, ax = plt.subplots(figsize=(7, 5))
-    im = ax.imshow(np.nan_to_num(qgrid.T), origin='lower', extent=[0, 20, 0, 10], aspect='auto', cmap='coolwarm')
+    qplot = np.copy(qgrid.T)
+    # mask unvisited
+    qmask = np.isnan(qplot)
+    qplot[qmask] = np.nan
+    if _HAS_SCIPY:
+        qsm = gaussian_filter(np.nan_to_num(qplot, nan=0.0), sigma=1.0)
+    else:
+        qsm = qplot
+    im = ax.imshow(qsm, origin='lower', extent=[0, 20, 0, 10], aspect='auto', cmap='coolwarm')
     fig.colorbar(im, ax=ax, label='Q value (approx)')
     #ax.set_title('Approximate Q-value heatmap (binned x,y)')
     ax.set_xlabel('x')
@@ -329,7 +418,18 @@ def plot_decision_region(df_steps):
                 grid[i, j] = 0
 
     fig, ax = plt.subplots(figsize=(7, 5))
-    im = ax.imshow(grid.T, origin='lower', cmap='coolwarm', extent=[0, 20, 0, 10])
+    # smooth the decision boundaries slightly for visualization (gaussian filter if available)
+    if _HAS_SCIPY:
+        grid_sm = gaussian_filter(grid.T, sigma=0.9)
+    else:
+        # simple 3x3 averaging kernel using scipy.signal if present, else fallback to original
+        try:
+            from scipy.signal import convolve2d as _conv
+            kernel = np.ones((3, 3)) / 9.0
+            grid_sm = _conv(grid.T, kernel, mode='same', boundary='symm')
+        except Exception:
+            grid_sm = grid.T
+    im = ax.imshow(grid_sm, origin='lower', cmap='coolwarm', extent=[0, 20, 0, 10])
     #ax.set_title('Decision region (sign of action0)')
     ax.set_xlabel('x')
     ax.set_ylabel('y')

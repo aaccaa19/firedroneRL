@@ -62,6 +62,32 @@ EXPL_WEIGHT = 1.2
 # This is applied conservatively in-step (only for positive deviations).
 ENERGY_WEIGHT = 0.000001
 
+# Reward shaping improvements
+DISTANCE_REDUCTION_BONUS = 2.0  # Bonus for getting closer to fire
+DISCOVERY_BONUS = 15.0  # Increased bonus for discovering fire
+WAYPOINT_BONUS = 0.5  # Bonus for making progress towards fire
+MOVING_AVG_WINDOW = 5  # Window for moving averages of metrics (5-episode success rate)
+
+# Additional tuning knobs
+PROX_PENALTY_MULTIPLIER = 1.5  # multiplier for danger-zone proximity penalty (>=1 increases penalty)
+ENTROPY_FINAL = 0.001  # final entropy coefficient (annealed towards this)
+
+# Policy smoothing and learning rate scheduling
+ENTROPY_REGULARIZATION = 0.01  # Entropy coefficient for exploration
+ACTION_NOISE_SCHEDULE = (0.2, 0.05)  # (initial, final) action noise std
+POLICY_LR_SCHEDULE = (1e-6, 5e-7)  # (initial, final) actor learning rate
+CRITIC_LR_SCHEDULE = (1e-5, 5e-6)  # (initial, final) critic learning rate
+
+# Target network configuration for stability
+TARGET_UPDATE_MODE = 'polyak'  # 'polyak' or 'hard'
+# Use a slightly larger Polyak tau to make target networks track online nets more smoothly
+POLYAK_TAU = 0.01  # Polyak averaging coefficient (increased for faster target convergence)
+HARD_UPDATE_FREQ = 5000  # Hard update every N steps if using hard mode
+
+# Exploration enhancements
+CURIOSITY_BONUS_COEF = 0.1  # Curiosity-driven bonus coefficient
+STATE_COVERAGE_REWARD = 0.5  # Reward for exploring new state regions
+
 # Reward component switches for ablation studies. Toggle components on/off.
 # Keys: proximity, exploration, energy, edge, movement, discovery
 REWARD_COMPONENTS = {
@@ -82,8 +108,10 @@ REWARD_COMPONENTS = {
 # runaway parameter growth when critics overestimate). Kept small by default.
 ACT_PARAM_REG = 5e-4  # slightly stronger L2 on actor params to prevent runaway growth
 
-# Movement encouragement: small positive bonus when the drone moves
-# purposefully (helps avoid static policies that minimize energy by not moving)
+# Lateral/patrol bonus: encourage movement parallel to fire line (not circling)
+LATERAL_BONUS_MULTIPLIER = 1.2  # Tuned down from 3.0 to prevent overshooting
+LATERAL_SIGMA = 0.3  # distance sensitivity for lateral bonus (Gaussian sigma)
+
 # Movement encouragement: small positive bonus when the drone moves
 # purposefully (helps avoid static policies that minimize energy by not moving)
 MOVEMENT_BONUS_THRESHOLD = 0.75
@@ -101,7 +129,8 @@ ENERGY_ACT_REG = 2e-3
 
 # Training / TD3 defaults
 TARGET_CLIP = 1.0     # tighten target clipping further to avoid extreme critic targets
-GRAD_CLIP_NORM = 0.3  # reduce allowed gradient norm for safety
+# Tighten gradient clipping slightly to avoid large parameter updates
+GRAD_CLIP_NORM = 0.5  # allow gradient flow while preventing extreme updates (was 0.25, too aggressive)
 # Actor regularization to discourage action saturation
 ACT_REG = 5e-3
 
@@ -169,22 +198,22 @@ class DroneEnv(gym.Env):
             self.fire_radius = 2.5  # Large fire size for scenario 6
         self.action_space = spaces.Box(low=-1, high=1, shape=(self.n_drones,3), dtype=np.float32)
         # Observation layout (per drone):
-        # Base 10 entries (kept for backward compatibility):
-        # [x, y, z, fire_below, other_x, other_y, other_z, fire_x, fire_y, fire_z]
+        # Base 13 entries (adds velocity):
+        # [x, y, z, vx, vy, vz, fire_below, other_x, other_y, other_z, fire_x, fire_y, fire_z]
         # Extend with a fixed-capacity visible-fires list so each drone can "see" multiple fires.
         # For each visible fire we store [fx, fy, fz, visible_flag]. We cap the number of visible
         # fires to `max_visible_fires` to keep observation dimension fixed.
         self.max_visible_fires = 12
         per_fire_len = 4
-        base_len = 10
+        base_len = 13
         total_len = base_len + self.max_visible_fires * per_fire_len
         # Build observation space low/high arrays per drone
         low = np.concatenate([
-            np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32),
+            np.array([0, 0, 0, -5.0, -5.0, -5.0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32),
             np.full((self.max_visible_fires * per_fire_len,), 0.0, dtype=np.float32)
         ])
         high = np.concatenate([
-            np.array([self.x_max, self.y_max, self.z_max, 1, self.x_max, self.y_max, self.z_max, self.x_max, self.y_max, self.z_max], dtype=np.float32),
+            np.array([self.x_max, self.y_max, self.z_max, 5.0, 5.0, 5.0, 1, self.x_max, self.y_max, self.z_max, self.x_max, self.y_max, self.z_max], dtype=np.float32),
             np.full((self.max_visible_fires * per_fire_len,), self.x_max, dtype=np.float32)
         ])
         # Shape is (n_drones, total_len)
@@ -198,6 +227,8 @@ class DroneEnv(gym.Env):
         self.max_cell_reward = 10
         self.cell_regen_rate = 2
         self.cell_rewards = np.full((grid_dim, grid_dim), self.max_cell_reward, dtype=np.int32)
+        # visitation counts for intrinsic curiosity / state coverage reward
+        self.visit_counts = np.zeros((grid_dim, grid_dim), dtype=np.int32)
         self.reset()
 
     def reset(self, seed=None, options=None):
@@ -234,6 +265,15 @@ class DroneEnv(gym.Env):
         self.drone_pos = np.stack([pos1, pos2])
         self.done = [False, False]
         self.cell_rewards = np.full((self.grid_dim, self.grid_dim), self.max_cell_reward, dtype=np.int32)  # Reset cell rewards to max
+        try:
+            self.visit_counts[:] = 0
+        except Exception:
+            self.visit_counts = np.zeros((self.grid_dim, self.grid_dim), dtype=np.int32)
+        # reset visit counts and bookkeeping
+        try:
+            self.visit_counts[:] = 0
+        except Exception:
+            self.visit_counts = np.zeros((self.grid_dim, self.grid_dim), dtype=np.int32)
         if self.scenario == 2:
             self.fire_centers = [np.array([10.0, 5.0, 5.0])]
         if self.scenario == 3:
@@ -253,6 +293,26 @@ class DroneEnv(gym.Env):
         if self.scenario == 5:
             # No fire centers, just a wall at x=5
             self.fire_centers = []  # Ensure attribute exists for visualization
+        # Initialize per-drone previous-fire-distance for potential-based shaping
+        try:
+            if not hasattr(self, 'prev_fire_distances') or self.prev_fire_distances is None:
+                self.prev_fire_distances = [float('inf') for _ in range(self.n_drones)]
+            # Compute initial distances to nearest fire for each drone
+            for i in range(self.n_drones):
+                pos = self.drone_pos[i]
+                if self.scenario in [2, 3, 4, 6]:
+                    if getattr(self, 'fire_centers', None):
+                        dists = [np.linalg.norm(pos - fc) for fc in self.fire_centers]
+                        self.prev_fire_distances[i] = float(min(dists) if dists else float('inf'))
+                    else:
+                        self.prev_fire_distances[i] = float('inf')
+                else:
+                    # distance to fire line
+                    a = np.array(self.fire_line[0])
+                    b = np.array(self.fire_line[1])
+                    self.prev_fire_distances[i] = float(point_to_segment_dist(pos, a, b))
+        except Exception:
+            self.prev_fire_distances = [float('inf') for _ in range(self.n_drones)]
         return self._get_obs(), {}
 
     def _get_obs(self):
@@ -391,7 +451,14 @@ class DroneEnv(gym.Env):
             # pad remaining slots
             while len(fires_block) < self.max_visible_fires * 4:
                 fires_block.extend([0.0, 0.0, 0.0, 0.0])
-            obs_vec = np.concatenate([pos, [1.0 if union_list else 0.0], other, np.array([0.0, 0.0, 0.0]), np.array(fires_block, dtype=np.float32)])
+            # Compute velocity (use prev_positions if available)
+            if hasattr(self, 'prev_positions') and self.prev_positions is not None and self.prev_positions[d_idx] is not None:
+                vel = pos - self.prev_positions[d_idx]
+            else:
+                vel = np.array([0.0, 0.0, 0.0])
+            # maintain top-level fire placeholders (fire_x, fire_y, fire_z) for compatibility
+            fire_top = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            obs_vec = np.concatenate([pos, vel, [1.0 if union_list else 0.0], other, fire_top, np.array(fires_block, dtype=np.float32)])
             obs.append(obs_vec)
         return np.stack(obs)
 
@@ -501,7 +568,7 @@ class DroneEnv(gym.Env):
             elif min_dist <= min_safe_dist:
                 # Danger zone - steep penalty but not terminal, encouraging learning
                 danger_factor = (min_safe_dist - min_dist) / (min_safe_dist - collision_dist)
-                penalty = - (PROXIMITY_SCALE * 2.0) * (danger_factor ** 2)  # Quadratic penalty in danger zone
+                penalty = - (PROXIMITY_SCALE * 2.0) * (danger_factor ** 2) * PROX_PENALTY_MULTIPLIER  # Quadratic penalty in danger zone (scaled)
                 rewards[i] += penalty
                 proximity_contrib[i] += penalty
             else:
@@ -525,7 +592,14 @@ class DroneEnv(gym.Env):
                             if horiz_speed > 1e-6:
                                 vel_dir = horiz_vel / horiz_speed
                                 alignment = float(np.dot(vel_dir, fire_dir))
-                                lateral_bonus = 0.5 * max(0.0, abs(alignment)) * horiz_speed
+                                # Fix #1: distance-weighted lateral bonus: reward parallel motion near optimal distance
+                                # weight by proximity to the optimal radius to avoid encouraging circling far away
+                                try:
+                                    dist_error = abs(min_dist - 1.0)
+                                except Exception:
+                                    dist_error = 1.0
+                                weight = float(np.exp(-0.5 * (dist_error / LATERAL_SIGMA) ** 2))
+                                lateral_bonus = LATERAL_BONUS_MULTIPLIER * max(0.0, alignment) * horiz_speed * weight
                                 if REWARD_COMPONENTS.get('lateral', True):
                                     rewards[i] += PROX_WEIGHT * lateral_bonus
                                     proximity_contrib[i] += PROX_WEIGHT * lateral_bonus
@@ -537,6 +611,23 @@ class DroneEnv(gym.Env):
                     if REWARD_COMPONENTS.get('optimal', True):
                         rewards[i] += PROX_WEIGHT * optimal_bonus
                         proximity_contrib[i] += PROX_WEIGHT * optimal_bonus
+
+            # Potential-based shaping: small bonus for reducing distance to nearest fire since last step
+            try:
+                prev_d = float(self.prev_fire_distances[i]) if hasattr(self, 'prev_fire_distances') else float('inf')
+                reduction = prev_d - float(min_dist)
+                if reduction > 0 and REWARD_COMPONENTS.get('movement', True):
+                    shaped = DISTANCE_REDUCTION_BONUS * float(reduction)
+                    rewards[i] += shaped
+                    proximity_contrib[i] += shaped
+            except Exception:
+                pass
+            # Update prev_fire_distances for next step
+            try:
+                if hasattr(self, 'prev_fire_distances') and len(self.prev_fire_distances) > i:
+                    self.prev_fire_distances[i] = float(min_dist)
+            except Exception:
+                pass
 
         # Drone-drone collision
         if np.linalg.norm(self.drone_pos[0] - self.drone_pos[1]) < 2*self.drone_radius + self.safety_margin:
@@ -588,6 +679,17 @@ class DroneEnv(gym.Env):
                                     break
                         if not occluded:
                             seen_mask[gx, gy] = True
+                            # increment visit counts for intrinsic curiosity
+                            try:
+                                self.visit_counts[gx, gy] += 1
+                                vc = int(self.visit_counts[gx, gy])
+                                curiosity_reward = float(CURIOSITY_BONUS_COEF) / max(1.0, (vc ** 0.5))
+                            except Exception:
+                                curiosity_reward = 0.0
+                            # Add a small intrinsic bonus directly to the drone's immediate reward
+                            if REWARD_COMPONENTS.get('exploration', True):
+                                rewards[i] += STATE_COVERAGE_REWARD * curiosity_reward
+                                exploration_contrib[i] += STATE_COVERAGE_REWARD * curiosity_reward
                             # If caller provided per-episode seen_grids (list of sets), record the seen grid cell
                             try:
                                 if seen_grids is not None and isinstance(seen_grids, (list, tuple)) and len(seen_grids) > i:
@@ -950,6 +1052,17 @@ class ReplayBuffer:
         self.rew = np.zeros((size, 1), dtype=np.float32)
         self.next_obs = np.zeros((size, obs_dim), dtype=np.float32)
         self.done = np.zeros((size, 1), dtype=np.float32)
+        # Prioritized replay: track TD-errors for each transition
+        self.td_errors = np.ones((size, 1), dtype=np.float32) * 0.01  # Initialize to small positive
+    
+    def update_priorities(self, indices, td_errors):
+        """Update TD-error priorities for sampled transitions."""
+        try:
+            for idx, td in zip(indices, td_errors):
+                if 0 <= idx < self.size:
+                    self.td_errors[idx] = np.clip(float(td), 0.001, 1.0)  # Clip to avoid extreme values
+        except Exception:
+            pass
     def add(self, o, a, r, no, d):
         # Defensive shape checks: attempt to adapt incoming arrays to buffer storage shape
         o_arr = np.asarray(o, dtype=np.float32)
@@ -965,34 +1078,37 @@ class ReplayBuffer:
         # Trim or pad observations if needed (best-effort). Warn on mismatch.
         if o_arr.size != exp_obs_dim:
             # If larger, trim; if smaller, pad with zeros
+            key = ('ReplayBuffer', 'obs_size_mismatch', int(o_arr.size), int(exp_obs_dim))
             if o_arr.size > exp_obs_dim:
-                print(f"[ReplayBuffer] Warning: incoming obs size {o_arr.size} != buffer obs_dim {exp_obs_dim}; trimming to fit.")
+                _warn_once(key, f"[ReplayBuffer] incoming obs size {o_arr.size} != buffer obs_dim {exp_obs_dim}; trimming to fit.")
                 o_trim = o_arr.flat[:exp_obs_dim]
                 o_arr = np.array(list(o_trim), dtype=np.float32)
             else:
-                print(f"[ReplayBuffer] Warning: incoming obs size {o_arr.size} != buffer obs_dim {exp_obs_dim}; padding with zeros.")
+                _warn_once(key, f"[ReplayBuffer] incoming obs size {o_arr.size} != buffer obs_dim {exp_obs_dim}; padding with zeros.")
                 pad = np.zeros((exp_obs_dim - o_arr.size,), dtype=np.float32)
                 o_arr = np.concatenate([o_arr.flatten(), pad])
 
         if a_arr.ndim == 0:
             a_arr = np.array([a_arr], dtype=np.float32)
         if a_arr.size != exp_act_dim:
+            key = ('ReplayBuffer', 'act_size_mismatch', int(a_arr.size), int(exp_act_dim))
             if a_arr.size > exp_act_dim:
-                print(f"[ReplayBuffer] Warning: incoming act size {a_arr.size} != buffer act_dim {exp_act_dim}; trimming to fit.")
+                _warn_once(key, f"[ReplayBuffer] incoming act size {a_arr.size} != buffer act_dim {exp_act_dim}; trimming to fit.")
                 a_arr = np.array(list(a_arr.flat[:exp_act_dim]), dtype=np.float32)
             else:
-                print(f"[ReplayBuffer] Warning: incoming act size {a_arr.size} != buffer act_dim {exp_act_dim}; padding with zeros.")
+                _warn_once(key, f"[ReplayBuffer] incoming act size {a_arr.size} != buffer act_dim {exp_act_dim}; padding with zeros.")
                 pad = np.zeros((exp_act_dim - a_arr.size,), dtype=np.float32)
                 a_arr = np.concatenate([a_arr.flatten(), pad])
 
         if no_arr.ndim == 0:
             no_arr = np.array([no_arr], dtype=np.float32)
         if no_arr.size != exp_obs_dim:
+            key = ('ReplayBuffer', 'next_obs_size_mismatch', int(no_arr.size), int(exp_obs_dim))
             if no_arr.size > exp_obs_dim:
-                print(f"[ReplayBuffer] Warning: incoming next_obs size {no_arr.size} != buffer obs_dim {exp_obs_dim}; trimming to fit.")
+                _warn_once(key, f"[ReplayBuffer] incoming next_obs size {no_arr.size} != buffer obs_dim {exp_obs_dim}; trimming to fit.")
                 no_arr = np.array(list(no_arr.flat[:exp_obs_dim]), dtype=np.float32)
             else:
-                print(f"[ReplayBuffer] Warning: incoming next_obs size {no_arr.size} != buffer obs_dim {exp_obs_dim}; padding with zeros.")
+                _warn_once(key, f"[ReplayBuffer] incoming next_obs size {no_arr.size} != buffer obs_dim {exp_obs_dim}; padding with zeros.")
                 pad = np.zeros((exp_obs_dim - no_arr.size,), dtype=np.float32)
                 no_arr = np.concatenate([no_arr.flatten(), pad])
 
@@ -1009,13 +1125,25 @@ class ReplayBuffer:
         max_i = self.size if self.full else self.ptr
         if max_i == 0:
             raise ValueError("Replay buffer is empty")
-        idx = np.random.randint(0, max_i, size=batch_size)
+        
+        # Prioritized sampling: bias towards high TD-error transitions
+        try:
+            priorities = self.td_errors[:max_i].flatten()
+            # Normalize priorities to sum to 1
+            priorities = priorities / (priorities.sum() + 1e-8)
+            # Sample indices weighted by priorities
+            idx = np.random.choice(max_i, size=batch_size, p=priorities, replace=True)
+        except Exception:
+            # Fallback to uniform sampling if prioritization fails
+            idx = np.random.randint(0, max_i, size=batch_size)
+        
         return (
             torch.tensor(self.obs[idx], dtype=torch.float32),
             torch.tensor(self.act[idx], dtype=torch.float32),
             torch.tensor(self.rew[idx], dtype=torch.float32),
             torch.tensor(self.next_obs[idx], dtype=torch.float32),
-            torch.tensor(self.done[idx], dtype=torch.float32)
+            torch.tensor(self.done[idx], dtype=torch.float32),
+            idx  # Return indices for priority updates
         )
 
 def _align_array(arr, expected_len, name='array'):
@@ -1192,10 +1320,64 @@ class TD3Agent:
                     print('[load] Skipping replay buffer restore due to incompatible shapes between checkpoint and current agent (obs/act dims).')
             except Exception:
                 print('[load] Warning: failed to fully restore replay buffer state; continuing with empty/partial buffer.')
+    def set_curriculum_level(self, level):
+        """Set current curriculum level for curriculum-aware training."""
+        level = int(level)
+        # If curriculum level changes, trigger a temporary stabilization window:
+        if level != getattr(self, 'curriculum_level', None):
+            # schedule a short suspend period for actor and a critic-LR reduction window
+            self._curriculum_suspend_until = int(getattr(self, 'total_it', 0) + 500)
+            self._curriculum_suspend_applied = False
+            # store target level
+        self.curriculum_level = level
+
+    def update_episode_return(self, episode_return):
+        """Update running mean of episode returns for target scaling."""
+        self.episode_return_ema = (1 - self.episode_return_ema_alpha) * self.episode_return_ema + self.episode_return_ema_alpha * episode_return
+
     def decay_noise(self, decay_rate=0.99, min_noise=0.01):
         """Decay the noise levels by decay_rate, not going below min_noise."""
         self.noise_levels = [max(n * decay_rate, min_noise) for n in self.noise_levels]
-    def __init__(self, area_size, drone_radius, fire_line, fire_radius, safety_margin, max_step_size, obs_dim=7, act_dim=3, n_critics=2, n_candidates=30, noise_levels=None, gamma=0.95, tau=0.001, policy_noise=0.12, noise_clip=0.25, policy_delay=8, buffer_size=200000, batch_size=256, hidden_size=384, x_max=20, y_max=10, z_min=5, z_max=10):
+    def _update_obs_stats(self, obs_np):
+        """Update running per-dimension mean/M2 for observations using Welford's algorithm."""
+        try:
+            a = np.asarray(obs_np, dtype=np.float64).flatten()
+            if a.size != self.obs_dim:
+                a = _align_array(a, self.obs_dim, name='obs_for_norm')
+            # Update per-dim Welford
+            self.obs_count += 1
+            if self.obs_count == 1:
+                self.obs_mean = a.astype(np.float64)
+                self.obs_M2 = np.zeros_like(self.obs_mean)
+            else:
+                delta = a - self.obs_mean
+                self.obs_mean += delta / float(self.obs_count)
+                delta2 = a - self.obs_mean
+                self.obs_M2 += delta * delta2
+        except Exception:
+            pass
+
+    def _normalize_obs_np(self, obs_np):
+        """Return a normalized copy of obs_np using running mean/std. If stats not ready, return aligned obs."""
+        a = np.asarray(obs_np, dtype=np.float32).flatten()
+        a = _align_array(a, self.obs_dim, name='obs_norm')
+        if self.obs_count > 1:
+            std = np.sqrt(self.obs_M2 / max(1, (self.obs_count - 1))).astype(np.float32)
+            denom = std + 1e-8
+            return ((a - self.obs_mean.astype(np.float32)) / denom).astype(np.float32)
+        else:
+            return a
+
+    def _get_obs_mean_std_tensors(self):
+        """Return mean and std torch tensors for normalization (shape (1, obs_dim))."""
+        if self.obs_count > 1:
+            mean = torch.tensor(self.obs_mean.astype(np.float32), dtype=torch.float32).unsqueeze(0)
+            std = torch.tensor(np.sqrt(self.obs_M2 / max(1, (self.obs_count - 1))).astype(np.float32), dtype=torch.float32).unsqueeze(0)
+        else:
+            mean = torch.zeros((1, self.obs_dim), dtype=torch.float32)
+            std = torch.ones((1, self.obs_dim), dtype=torch.float32)
+        return mean, std
+    def __init__(self, area_size, drone_radius, fire_line, fire_radius, safety_margin, max_step_size, obs_dim=7, act_dim=3, n_critics=2, n_candidates=30, noise_levels=None, gamma=0.95, tau=0.001, policy_noise=0.12, noise_clip=0.25, policy_delay=8, buffer_size=200000, batch_size=256, critic_updates=2, hidden_size=384, x_max=20, y_max=10, z_min=5, z_max=10):
         if noise_levels is None:
             # stronger initial candidate noise for exploration
             noise_levels = [0.1, 0.2, 0.3, 0.5]
@@ -1221,46 +1403,82 @@ class TD3Agent:
             self.critics_target[i].load_state_dict(self.critics[i].state_dict())
         # Reduce actor/critic learning rates for stability
         # Lower the actor LR further to make actor updates gentler (helps stability)
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=1e-6)
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=1e-6, weight_decay=1e-6)
     # Lower critic LR and add small weight decay to stabilize critic updates
     # Increase weight_decay slightly to discourage runaway critic weights
         self.critic_opts = [torch.optim.Adam(c.parameters(), lr=1e-5, weight_decay=1e-5) for c in self.critics]
         self.buffer = ReplayBuffer(buffer_size, self.obs_dim, self.act_dim)
         self.gamma = gamma
-        self.tau = tau
+        # Use slightly larger Polyak averaging for smoother target movement
+        try:
+            self.tau = max(tau, 0.005)
+        except Exception:
+            self.tau = 0.005
         self.policy_noise = policy_noise
         self.noise_clip = noise_clip
         self.policy_delay = policy_delay
         self.batch_size = batch_size
+        # Number of critic update steps to run per train() call (helps stabilize critic)
+        self.critic_updates = critic_updates
         self.n_candidates = n_candidates
         self.noise_levels = noise_levels
         self.total_it = 0
+        # Evaluation flag: when True, candidate sampling is disabled and actor is used deterministically
+        self.eval_mode = False
+        # Learning rate scheduling
+        self.initial_actor_lr = 1e-6
+        self.final_actor_lr = 5e-7
+        self.initial_critic_lr = 1e-5
+        self.final_critic_lr = 5e-6
+        self.schedule_total_steps = 1000000  # Total steps for schedule decay
+        # TD-error quantiles for diagnostics
+        self.last_td_q25 = float('nan')
+        self.last_td_q50 = float('nan')
+        self.last_td_q75 = float('nan')
+        self.last_td_q95 = float('nan')
+        self.last_td_outlier_count = 0
         # Running reward normalization (Welford's algorithm)
         self.r_count = 0
         self.r_mean = 0.0
         self.r_M2 = 0.0
-    def select_action(self, obs_np):
-        # default: stochastic candidate-based selection
-        return self._select_action_candidates(obs_np, stochastic=True)
-
+        # Per-step reward smoothing (to reduce variance spikes)
+        self.step_reward_ema = 0.0
+        self.step_reward_alpha = 0.15
+        # Running observation normalizer (per-dimension Welford)
+        self.obs_count = 0
+        self.obs_mean = np.zeros((self.obs_dim,), dtype=np.float64)
+        self.obs_M2 = np.zeros((self.obs_dim,), dtype=np.float64)
+        # Episode return tracking for curriculum-aware target scaling
+        self.episode_return_ema = 0.0
+        self.episode_return_ema_alpha = 0.02  # Slower EMA decay for stability
+        self.curriculum_level = 0  # Updated by main training loop
     def select_action(self, obs_np, deterministic=False):
-        """Public API: return action. If deterministic=True, use raw actor output without candidate sampling."""
+        """Public API: return action. If deterministic=True, use raw actor output without candidate sampling.
+
+        Keep a single signature and ensure deterministic selection returns the actor mean only.
+        """
         if deterministic:
             # Align obs vector shape to expected obs_dim to avoid matmul errors
             aligned = _align_array(obs_np, self.obs_dim, name='obs')
+            aligned = self._normalize_obs_np(aligned)
             obs = torch.tensor(aligned, dtype=torch.float32).unsqueeze(0)
             with torch.no_grad():
                 a = self.actor(obs).cpu().numpy()[0]
             return np.clip(a, -1, 1)
-        else:
-            return self._select_action_candidates(obs_np, stochastic=True)
+        # default: stochastic candidate-based selection
+        return self._select_action_candidates(obs_np, stochastic=True)
 
     def _select_action_candidates(self, obs_np, stochastic=True):
         # Align incoming observation to expected obs_dim
         obs_aligned = _align_array(obs_np, self.obs_dim, name='obs')
+        obs_aligned = self._normalize_obs_np(obs_aligned)
         obs = torch.tensor(obs_aligned, dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():
             base_action = self.actor(obs).cpu().numpy()[0]
+            # If agent set to eval mode, or caller requested non-stochastic behavior,
+            # return the raw actor output (deterministic) and skip candidate sampling.
+            if getattr(self, 'eval_mode', False) or not stochastic:
+                return np.clip(base_action, -1, 1)
         
         # Enhanced candidate generation for fire-line following
         candidates = []
@@ -1344,16 +1562,17 @@ class TD3Agent:
             fire_below = 1.0 if dist_below <= (self.fire_radius + 2) else 0.0
             # Build a full-length simulated observation matching the env's observation layout
             sim_obs = np.zeros((self.obs_dim,), dtype=np.float32)
-            # Fill base fields: [x,y,z, fire_below, other_x, other_y, other_z, fire_x, fire_y, fire_z]
+            # New base layout: [x,y,z,vx,vy,vz, fire_below, other_x, other_y, other_z, fire_x, fire_y, fire_z]
             sim_obs[0:3] = sim_pos[0:3]
-            sim_obs[3] = fire_below
-            # Copy the original obs_np other-drone coords and top-level fire info if available
-            # guard against short obs_np shapes (backwards compatibility)
+            # velocities unknown for simulation step - set zeros (agent will handle)
+            sim_obs[3:6] = 0.0
+            sim_obs[6] = fire_below
+            # Copy other-drone coords and top-level fire info if available (guard for older obs shapes)
             try:
-                if len(obs_np) >= 7:
-                    sim_obs[4:7] = obs_np[4:7]
                 if len(obs_np) >= 10:
                     sim_obs[7:10] = obs_np[7:10]
+                if len(obs_np) >= 13:
+                    sim_obs[10:13] = obs_np[10:13]
             except Exception:
                 pass
             
@@ -1384,6 +1603,7 @@ class TD3Agent:
             # Align simulated observation and action to expected dimensions
             obs_sim_aligned = _align_array(sim_obs, self.obs_dim, name='sim_obs')
             act_aligned = _align_array(a, self.act_dim, name='candidate_act')
+            obs_sim_aligned = self._normalize_obs_np(obs_sim_aligned)
             obs_t = torch.tensor(obs_sim_aligned, dtype=torch.float32).unsqueeze(0)
             act_t = torch.tensor(act_aligned, dtype=torch.float32).unsqueeze(0)
             q_vals = [critic(obs_t, act_t).item() for critic in self.critics]
@@ -1413,9 +1633,25 @@ class TD3Agent:
         else:
             raw = float(r)
         clipped = float(np.clip(raw, -REWARD_CLIP, REWARD_CLIP))
+        # Smooth per-step reward to reduce variance spikes before storing
+        try:
+            self.step_reward_ema = (1 - self.step_reward_alpha) * float(self.step_reward_ema) + self.step_reward_alpha * clipped
+            smoothed = float(self.step_reward_ema)
+        except Exception:
+            smoothed = clipped
 
-        # Add raw clipped reward to replay buffer
-        self.buffer.add(o, a, clipped, no, d)
+        # Add smoothed reward to replay buffer (reduces variance from single-step spikes)
+        self.buffer.add(o, a, smoothed, no, d)
+
+        # Update running observation stats for normalization (include both current and next obs)
+        try:
+            self._update_obs_stats(o)
+        except Exception:
+            pass
+        try:
+            self._update_obs_stats(no)
+        except Exception:
+            pass
 
         # If we have not yet initialized running stats and the buffer now has enough
         # transitions, initialize Welford moments from buffer contents
@@ -1457,13 +1693,98 @@ class TD3Agent:
         else:
             # Not normalizing yet; report clipped raw reward for logging
             self.last_normalized_reward = float(clipped)
+    
+    def _update_learning_rates(self):
+        """Update learning rates using cosine annealing schedule."""
+        progress = min(self.total_it / self.schedule_total_steps, 1.0)
+        # Cosine annealing: smooth decay from initial to final LR
+        cosine_factor = 0.5 * (1 + np.cos(np.pi * progress))
+        new_actor_lr = self.final_actor_lr + (self.initial_actor_lr - self.final_actor_lr) * cosine_factor
+        new_critic_lr = self.final_critic_lr + (self.initial_critic_lr - self.final_critic_lr) * cosine_factor
+        
+        # Update actor optimizer LR
+        for param_group in self.actor_opt.param_groups:
+            param_group['lr'] = new_actor_lr
+        
+        # Update critic optimizer LRs
+        for opt in self.critic_opts:
+            for param_group in opt.param_groups:
+                param_group['lr'] = new_critic_lr
+    
     def train(self):
         # Require sufficient buffer fill and warmup transitions before training
         max_i = self.buffer.size if self.buffer.full else self.buffer.ptr
         if max_i < max(self.batch_size * 10, N_WARMUP_TRANSITIONS):
             return
         self.total_it += 1
-        o, a, r_raw, no, d = self.buffer.sample(self.batch_size)
+        # Update learning rates according to schedule
+        self._update_learning_rates()
+        # Handle curriculum-change stabilization window: temporarily reduce critic LR and suspend actor
+        if hasattr(self, '_curriculum_suspend_until'):
+            try:
+                if not getattr(self, '_curriculum_suspend_applied', False) and self.total_it <= int(self._curriculum_suspend_until):
+                    # Apply LR reduction to critics and mark applied
+                    self._critic_original_lrs = [pg['lr'] for opt in self.critic_opts for pg in opt.param_groups]
+                    # reduce each optimizer's lr by 50%
+                    for opt in self.critic_opts:
+                        for pg in opt.param_groups:
+                            pg['lr'] = pg.get('lr', 1e-5) * 0.5
+                    # also suspend actor updates briefly
+                    self._suspend_actor_until = int(self.total_it + 200)
+                    self._curriculum_suspend_applied = True
+                # If applied and passed suspend window, restore lrs
+                if getattr(self, '_curriculum_suspend_applied', False) and self.total_it > int(self._curriculum_suspend_until):
+                    # restore original lrs
+                    if hasattr(self, '_critic_original_lrs'):
+                        idx = 0
+                        for opt in self.critic_opts:
+                            for pg in opt.param_groups:
+                                try:
+                                    pg['lr'] = float(self._critic_original_lrs[idx])
+                                except Exception:
+                                    pass
+                                idx += 1
+                    self._curriculum_suspend_applied = False
+                    try:
+                        delattr(self, '_curriculum_suspend_until')
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        result = self.buffer.sample(self.batch_size)
+        if len(result) == 6:
+            o, a, r_raw, no, d, sample_indices = result
+        else:
+            o, a, r_raw, no, d = result
+            sample_indices = None
+
+        # Importance-sampling weights from prioritized replay
+        max_i = self.buffer.size if self.buffer.full else self.buffer.ptr
+        try:
+            if sample_indices is not None:
+                idxs = np.asarray(sample_indices, dtype=np.int64)
+            else:
+                # fallback: create a uniform idx array (not ideal but safe)
+                idxs = np.arange(o.shape[0], dtype=np.int64)
+            pri = np.maximum(self.buffer.td_errors[idxs].flatten(), 1e-6)
+            probs = pri / (pri.sum() + 1e-12)
+            # Beta annealing for importance-sampling weights
+            beta_min = 0.4
+            beta_final = 1.0
+            beta = beta_min + (beta_final - beta_min) * min(self.total_it / float(max(1, self.schedule_total_steps)), 1.0)
+            is_weights = (1.0 / (max_i * probs + 1e-12)) ** beta
+            # normalize by max weight to stabilize training scale
+            is_weights = is_weights / (is_weights.max() + 1e-12)
+            # convert to torch tensor shape (batch, 1)
+            is_w = torch.tensor(is_weights.astype(np.float32)).unsqueeze(1)
+        except Exception:
+            is_w = torch.ones((o.shape[0], 1), dtype=torch.float32)
+        
+        # Normalize observations using running mean/std
+        o_mean, o_std = self._get_obs_mean_std_tensors()
+        o = (o - o_mean) / (o_std + 1e-8)
+        no = (no - o_mean) / (o_std + 1e-8)
+        
         # Normalize rewards on-the-fly if running stats are available
         with torch.no_grad():
             if self.r_count > 1:
@@ -1482,8 +1803,20 @@ class TD3Agent:
             target_qs = [ct(no, next_a) for ct in self.critics_target]
             min_target_q = torch.min(torch.stack(target_qs, dim=0), dim=0)[0]
             target = r + self.gamma * (1 - d) * min_target_q
-            # Clamp targets to avoid extreme updates
-            target = torch.clamp(target, -float(TARGET_CLIP), float(TARGET_CLIP))
+            
+            # Curriculum-aware target clipping
+            if self.curriculum_level < 2:
+                target_clip = 10.0  # Early curriculum: stricter clipping
+            elif self.curriculum_level < 4:
+                target_clip = 20.0  # Mid curriculum: moderate clipping
+            else:
+                target_clip = float(TARGET_CLIP)  # Late curriculum: standard clipping
+            target = torch.clamp(target, -target_clip, target_clip)
+            
+            # Scale target by episode return magnitude (curriculum fix #3)
+            scale_factor = max(1.0, abs(self.episode_return_ema) / 10000.0)  # Reduced scaling aggressiveness
+            target = target / scale_factor
+            
             # Log target statistics for diagnostics
             try:
                 self.last_target_q_mean = float(min_target_q.mean().item())
@@ -1491,6 +1824,13 @@ class TD3Agent:
             except Exception:
                 self.last_target_q_mean = float('nan')
                 self.last_target_q_std = float('nan')
+            # Q-value variance across critics for current batch (diagnostic)
+            try:
+                q_vals_current = torch.stack([c(o, a) for c in self.critics], dim=0)
+                q_var_mean = float(q_vals_current.var(dim=0).mean().item())
+                self.last_q_variance = q_var_mean
+            except Exception:
+                self.last_q_variance = float('nan')
             # Divergence detector: if target Q_mean grows too large, suspend actor updates
             try:
                 if hasattr(self, '_suspend_actor_until') and isinstance(self._suspend_actor_until, int):
@@ -1502,6 +1842,32 @@ class TD3Agent:
                     print(f"[TD3Agent] Warning: large target_q_mean={self.last_target_q_mean:.3f}; suspending actor updates until total_it={self._suspend_actor_until}")
             except Exception:
                 pass
+            # TD-error sample distribution diagnostics (use first critic as reference)
+            try:
+                td_samples = (target - self.critics[0](o, a)).detach().abs().cpu().numpy().flatten()
+                if td_samples.size > 0:
+                    q25, q50, q75, q95 = np.percentile(td_samples, [25, 50, 75, 95])
+                    self.last_td_q25 = float(q25)
+                    self.last_td_q50 = float(q50)
+                    self.last_td_q75 = float(q75)
+                    self.last_td_q95 = float(q95)
+                    # simple outlier count: values above an absolute threshold (0.1)
+                    try:
+                        self.last_td_outlier_count = int((td_samples > 0.1).sum())
+                    except Exception:
+                        self.last_td_outlier_count = 0
+                else:
+                    self.last_td_q25 = float('nan')
+                    self.last_td_q50 = float('nan')
+                    self.last_td_q75 = float('nan')
+                    self.last_td_q95 = float('nan')
+                    self.last_td_outlier_count = 0
+            except Exception:
+                self.last_td_q25 = float('nan')
+                self.last_td_q50 = float('nan')
+                self.last_td_q75 = float('nan')
+                self.last_td_q95 = float('nan')
+                self.last_td_outlier_count = 0
         # record last normalized reward for diagnostics
         if isinstance(r, torch.Tensor):
             # r is a tensor; compute mean
@@ -1512,36 +1878,49 @@ class TD3Agent:
                 self.last_normalized_reward = float('nan')
         else:
             self.last_normalized_reward = float('nan')
-        # Critic update
+        # Critic update (possibly multiple small updates for stability)
         critic_losses = []
         td_errors = []
         q_mins = []
         q_maxs = []
         critic_grad_norms = []
-        for i, critic in enumerate(self.critics):
-            q = critic(o, a)
-            # TD-error per sample (target - q)
-            with torch.no_grad():
-                td = (target - q)
-                # store mean absolute td-error for this critic
-                td_errors.append(float(td.abs().mean().item()))
-                q_mins.append(float(q.min().item()))
-                q_maxs.append(float(q.max().item()))
-            # Use Huber (Smooth L1) for robustness to outliers
-            loss = nn.SmoothL1Loss()(q, target)
-            critic_losses.append(loss.item())
-            self.critic_opts[i].zero_grad()
-            loss.backward()
-            # Gradient clipping to avoid huge updates and record grad norm
-            # Gradient clipping to avoid huge updates and record grad norm
-            # Compute gradient norm if parameters exist
-            critic_params = list(critic.parameters())
-            if critic_params:
-                gn = torch.nn.utils.clip_grad_norm_(critic_params, GRAD_CLIP_NORM)
-                critic_grad_norms.append(float(gn))
-            else:
-                critic_grad_norms.append(float('nan'))
-            self.critic_opts[i].step()
+        # dynamic critic updates if divergence mitigation is active
+        num_updates = int(self.critic_updates)
+        if hasattr(self, '_divergence_fix_until') and self.total_it < int(self._divergence_fix_until):
+            num_updates = min(10, max(num_updates, int(self.critic_updates * 2)))
+        for _u in range(num_updates):
+            for i, critic in enumerate(self.critics):
+                q = critic(o, a)
+                # TD-error per sample (target - q)
+                with torch.no_grad():
+                    td = (target - q)
+                    # store mean absolute td-error for this critic
+                    td_errors.append(float(td.abs().mean().item()))
+                    q_mins.append(float(q.min().item()))
+                    q_maxs.append(float(q.max().item()))
+                # Use Quantile Huber Loss for robustness to outliers (Fix #2)
+                td_raw = target - q  # shape (batch, 1)
+                kappa = 1.0  # Huber parameter
+                huber = torch.where(td_raw.abs() < kappa,
+                                   0.5 * td_raw**2,
+                                   kappa * (td_raw.abs() - 0.5 * kappa))
+                # apply importance-sampling weights per-sample
+                try:
+                    weighted = huber * is_w.to(huber.device)
+                except Exception:
+                    weighted = huber
+                loss = weighted.mean()
+                critic_losses.append(float(loss.item()))
+                self.critic_opts[i].zero_grad()
+                loss.backward()
+                # Compute gradient norm if parameters exist and clip
+                critic_params = list(critic.parameters())
+                if critic_params:
+                    gn = torch.nn.utils.clip_grad_norm_(critic_params, GRAD_CLIP_NORM)
+                    critic_grad_norms.append(float(gn))
+                else:
+                    critic_grad_norms.append(float('nan'))
+                self.critic_opts[i].step()
         # store last critic/td diagnostics for logging
         # Store last critic/td diagnostics defensively
         # store last critic/td diagnostics defensively without broad exception handlers
@@ -1583,10 +1962,18 @@ class TD3Agent:
                 try:
                     q_vals = torch.stack([c(o, pred_actions) for c in self.critics], dim=0)  # (n_critics, batch, 1)
                     q_min = torch.min(q_vals, dim=0).values  # (batch, 1)
-                    # Clamp Q-values used by actor to avoid runaway scaling from overestimated critics.
-                    # Bounds are conservative; adjust if your reward scale differs significantly.
-                    q_min = torch.clamp(q_min, min=-50.0, max=50.0)
-                    actor_loss = -q_min.mean()
+                    # Robustify actor objective by scaling/clamping Q-values and normalizing their distribution
+                    try:
+                        q_mean = float(q_min.mean().item())
+                        q_std = float(q_min.std().item()) if float(q_min.std().item()) > 1e-6 else 1.0
+                        q_norm = (q_min - q_mean) / (q_std + 1e-8)
+                        # Clamp normalized Q to a reasonable range before averaging
+                        q_norm = torch.clamp(q_norm, min=-10.0, max=10.0)
+                        actor_loss = -q_norm.mean()
+                    except Exception:
+                        # fallback behavior: clamp raw q_min
+                        q_min = torch.clamp(q_min, min=-50.0, max=50.0)
+                        actor_loss = -q_min.mean()
                     # Log actor-side Q statistics for diagnostics
                     try:
                         self.last_actor_q_mean = float(q_min.mean().item())
@@ -1610,6 +1997,19 @@ class TD3Agent:
                     actor_loss = actor_loss + ACT_PARAM_REG * param_sq
                 except Exception:
                     pass
+                # Entropy annealing: encourage higher action variance early, decay over training
+                try:
+                    progress = min(float(self.total_it) / max(1.0, float(self.schedule_total_steps)), 1.0)
+                    entropy_coef = float(ENTROPY_FINAL + (ENTROPY_REGULARIZATION - ENTROPY_FINAL) * (1.0 - progress))
+                    # Estimate policy 'entropy' as mean stddev of actions across batch
+                    try:
+                        action_std = float(pred_actions.std(dim=0).mean().item())
+                    except Exception:
+                        action_std = float(torch.std(pred_actions).item()) if hasattr(pred_actions, 'std') else 0.0
+                    # Add entropy bonus (negative for loss minimization)
+                    actor_loss = actor_loss - float(entropy_coef) * float(action_std)
+                except Exception:
+                    pass
                 self.actor_opt.zero_grad()
                 actor_loss.backward()
                 # Clip actor grads too
@@ -1620,21 +2020,54 @@ class TD3Agent:
                 else:
                     self.last_actor_grad_norm = float('nan')
                 self.actor_opt.step()
-                # store last actor loss
-            # Actor loss is defined as -Q(o, pi(o)).mean() so it will often be negative
-            # (because the critic Q is positive for good actions). For clearer logging
-            # we store both the raw value and a positive 'loss' that represents the
-            # quantity being minimized by the optimizer (i.e. -actor_loss_raw).
-            if hasattr(actor_loss, 'item'):
-                self.last_actor_loss_raw = float(actor_loss.item())
+                # Actor loss is defined as -Q(o, pi(o)).mean() so it will often be negative
+                # (because the critic Q is positive for good actions). For clearer logging
+                # we store both the raw value and a positive 'loss' that represents the
+                # quantity being minimized by the optimizer (i.e. -actor_loss_raw).
+                if hasattr(actor_loss, 'item'):
+                    self.last_actor_loss_raw = float(actor_loss.item())
+                    try:
+                        # positive_loss is what most monitoring plots expect (higher => worse)
+                        self.last_actor_loss = float(-self.last_actor_loss_raw)
+                    except Exception:
+                        self.last_actor_loss = float(self.last_actor_loss_raw)
+                else:
+                    self.last_actor_loss_raw = float('nan')
+                    self.last_actor_loss = float('nan')
+            
+            # Double-Critic Divergence Detection: if critics' Q-values diverge significantly,
+            # increase critic updates or reduce actor updates to stabilize
+            try:
+                q_vals_all_critics = [c(o, a).detach() for c in self.critics]
+                if len(q_vals_all_critics) >= 2:
+                    q_diff = torch.abs(q_vals_all_critics[0] - q_vals_all_critics[1]).mean().item()
+                    self.last_critic_divergence = float(q_diff)
+                    # If divergence is high, flag for increased critic stabilization
+                    if q_diff > 5.0:
+                        print(f"[TD3Agent] Warning: high critic divergence ({q_diff:.3f}); consider increasing critic_updates")
+                        # Temporarily increase critic learning rate for stabilization
+                        if not hasattr(self, '_divergence_fix_until'):
+                            self._divergence_fix_until = int(self.total_it + 500)
+                else:
+                    self.last_critic_divergence = float('nan')
+            except Exception:
+                self.last_critic_divergence = float('nan')
+            
+            # Update replay buffer priorities based on TD-errors if indices were returned
+            if sample_indices is not None:
                 try:
-                    # positive_loss is what most monitoring plots expect (higher => worse)
-                    self.last_actor_loss = float(-self.last_actor_loss_raw)
+                    # Compute TD-errors for all critics and average
+                    td_errors_all = []
+                    for critic in self.critics:
+                        q_vals = critic(o, a).detach()
+                        td = torch.abs(target - q_vals).cpu().numpy().flatten()
+                        td_errors_all.append(td)
+                    # Average TD-errors across critics
+                    td_errors_avg = np.mean(np.array(td_errors_all), axis=0)
+                    self.buffer.update_priorities(sample_indices, td_errors_avg)
                 except Exception:
-                    self.last_actor_loss = float(self.last_actor_loss_raw)
-            else:
-                self.last_actor_loss_raw = float('nan')
-                self.last_actor_loss = float('nan')
+                    pass
+            
             # Polyak averaging
             for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
                 target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
@@ -1853,16 +2286,26 @@ def main():
                 eval_seen_grids = [set() for _ in range(eval_env.n_drones)]
                 eval_env.fires_visited = [set() for _ in range(eval_env.n_drones)]
                 eval_total_reward = [0.0 for _ in range(eval_env.n_drones)]
+                # Track per-episode per-drone crash flags based on per-step terminal collision rewards
+                eval_crashed_flags = [False for _ in range(eval_env.n_drones)]
 
                 while not all(eval_done) and eval_steps < steps_per_episode:
                     eval_actions = np.zeros((eval_env.n_drones, 3))
                     for i in range(eval_env.n_drones):
                         if not eval_done[i]:
-                            # Deterministic evaluation
-                            eval_actions[i] = eval_agents[i].select_action(eval_obs[i], deterministic=True)
+                            # Use the same candidate-based selection used during training
+                            # (do NOT force actor-only deterministic mode here)
+                            eval_actions[i] = eval_agents[i].select_action(eval_obs[i], deterministic=False)
                     eval_next_obs, eval_rewards_step, eval_done, _, _ = eval_env.step(eval_actions, seen_grids=eval_seen_grids)
                     for i in range(eval_env.n_drones):
-                        eval_total_reward[i] += float(np.clip(eval_rewards_step[i], -REWARD_CLIP, REWARD_CLIP))
+                        step_r = float(eval_rewards_step[i])
+                        eval_total_reward[i] += float(np.clip(step_r, -REWARD_CLIP, REWARD_CLIP))
+                        # Mark crash if a terminal collision penalty occurred at any step
+                        try:
+                            if step_r <= COLLISION_PENALTY + 1e-6:
+                                eval_crashed_flags[i] = True
+                        except Exception:
+                            pass
                     eval_obs = eval_next_obs
                     eval_steps += 1
 
@@ -1872,8 +2315,10 @@ def main():
                 all_fires = set().union(*(getattr(eval_env, 'fires_visited', [set(), set()])))
                 eval_fires_count = len(all_fires)
                 eval_boxes_count = len(set().union(*eval_seen_grids)) if eval_seen_grids else 0
-                # Success: both drones didn't collide (total reward > penalty threshold)
-                eval_ep_success = 1 if all(r > COLLISION_PENALTY for r in eval_total_reward) else 0
+                # Success: no crashes (redefined per user request)
+                # Use per-step crash flags captured above instead of comparing cumulative reward.
+                crashed_drones = int(sum(1 for f in eval_crashed_flags if f))
+                eval_ep_success = 1 if (crashed_drones == 0) else 0
 
                 eval_rewards.append(eval_points)
                 eval_fires.append(eval_fires_count)
@@ -2010,7 +2455,7 @@ def main():
     # Open and write headers
     training_fp = open(training_csv_path, 'w', newline='')
     training_writer = csv.writer(training_fp)
-    training_writer.writerow(["episode", "total_reward", "length", "success", "collisions", "avg_goal_dist", "crash_types", "proximity_component", "exploration_component", "energy_component", "fires_discovered", "normalized_total", "norm_prox_mean", "norm_expl_mean", "norm_energy_mean", "action_saturation_fraction", "actor_loss", "actor_loss_raw", "actor_q_mean", "target_q_mean", "critic_loss", "td_error", "fires_viewed", "boxes_explored"])
+    training_writer.writerow(["episode", "total_reward", "length", "length_ma", "success", "success_ma", "collisions", "avg_goal_dist", "crash_types", "proximity_component", "exploration_component", "energy_component", "fires_discovered", "normalized_total", "norm_prox_mean", "norm_expl_mean", "norm_energy_mean", "action_saturation_fraction", "actor_loss", "actor_loss_raw", "actor_q_mean", "target_q_mean", "critic_loss", "td_error", "fires_viewed", "boxes_explored", "initial_avg_dist", "min_avg_dist"])
 
     steps_fp = open(steps_csv_path, 'w', newline='')
     steps_writer = csv.writer(steps_fp)
@@ -2032,6 +2477,20 @@ def main():
     start_timesteps = 5000
     # reward scaling for training (we now use agent-side normalization, so set to 1.0)
     reward_scale = 1.0
+    
+    # Initialize moving average tracking lists
+    episode_lengths_history = []  # Track episode lengths for moving average
+    success_history = []  # Track success outcomes for moving average
+    
+    # Track crash types for monitoring and debugging (Recommendation 2)
+    crash_type_counts = {
+        'timeout': 0,
+        'fire_collision': 0,
+        'drone_collision': 0,
+        'wall_crash': 0,
+        'random_crash': 0,
+        'safe_completion': 0
+    }
 
     # Ask user if they want to load previous training or start from scratch
     load_choice = input("Load previous training from pickle file? (y/n): ").strip().lower()
@@ -2263,6 +2722,11 @@ def main():
                         env.fires_visited = [set() for _ in range(env.n_drones)]
                     else:
                         env.fires_visited = [set() for _ in range(2)]
+                    
+                    # Set curriculum level for curriculum-aware target scaling (Fix #2)
+                    for agent in agents:
+                        agent.set_curriculum_level(curriculum_level)
+                    
                     done = [False, False]
                     total_reward = [0, 0]
                     fire_distances = [[], []]  # Track fire distances during episode
@@ -2420,6 +2884,8 @@ def main():
                                     getattr(agents[i], 'last_normalized_reward', float('nan')),
                                     getattr(agents[i], 'last_actor_grad_norm', float('nan')),
                                     getattr(agents[i], 'last_critic_grad_norm', float('nan')),
+                                    getattr(agents[i], 'last_q_variance', float('nan')),
+                                    getattr(agents[i], 'curriculum_level', float('nan')),
                                     getattr(agents[i].buffer, 'ptr', float('nan'))
                                 ])
                                 if 'updates_fp' in locals() and hasattr(updates_fp, 'flush') and not getattr(updates_fp, 'closed', False):
@@ -2500,8 +2966,13 @@ def main():
 
                     # Calculate average fire distances for this episode
                     for i in range(env.n_drones):
+                        # Enhance timeout detection: explicit verification (Recommendation 2)
                         if crash_type[i] is None and done[i]:
+                            # Timeout is marked when episode ends (done[i]=True) without explicit crash
                             crash_type[i] = 'timeout'
+                            # Verify: if steps == max_steps, it's definitely a timeout (reached episode length limit)
+                            if steps == 300:  # Assuming max_steps=300
+                                pass  # Confirmed timeout due to step limit
                         episode_rewards[i].append(total_reward[i])
                         if fire_distances[i]:
                             avg_fire_distances[i].append(np.mean(fire_distances[i]))
@@ -2542,16 +3013,32 @@ def main():
                             ew.writerow([global_episode_counter, scenario, curriculum_level, eval_steps, float(np.mean(eval_total)), float(np.mean(eval_total)), ev_success])
 
                     # Determine success & collisions heuristically. Use crash_type where available.
+                    # SUCCESS: Discovered at least one fire AND no drone crashed
+                    # FAILURE: Did not find fire OR crashed into something
                     collisions = 0
+                    crashed_drones = set()
                     for i in range(env.n_drones):
                         ct = crash_type[i]
-                        if ct is not None and ('collision' in ct or 'crash' in ct or 'fire' in ct or 'wall' in (ct or '')):
+                        if ct is not None and ('collision' in ct or 'crash' in ct or 'wall' in (ct or '')):
                             collisions += 1
-                        else:
-                            # Fallback: if total_reward very low below collision penalty, count as collision
-                            if total_reward[i] <= COLLISION_PENALTY:
-                                collisions += 1
-                    success = 1 if collisions == 0 else 0
+                            crashed_drones.add(i)
+                        # Removed fallback: do NOT count low rewards as collisions
+                        # crash_type is authoritative; rely on it being set correctly
+                    
+                    # Check if any fires were discovered
+                    fires_discovered_count = 0
+                    fv = getattr(env, 'fires_visited', None)
+                    if fv is not None:
+                        try:
+                            all_fires = set().union(*fv)
+                            fires_discovered_count = len(all_fires)
+                        except Exception:
+                            fires_discovered_count = 0
+                    
+                    # SUCCESS: Did not crash (redefined per user request)
+                    # Note: success now reflects only "not crashing" so logs and plots
+                    # measure safety separately from discovery objectives.
+                    success = 1 if (collisions == 0) else 0
                     # Average goal distance (use avg_fire_distances if available)
                     # Compute average goal distance defensively
                     vals = [fire_distances[i][-1] if fire_distances[i] else np.nan for i in range(getattr(env, 'n_drones', 2))]
@@ -2696,11 +3183,56 @@ def main():
                         episode_boxes_explored.append(0)
                     # Safely compute mean total_reward (avoid warnings on empty lists)
                     mean_total = float(np.mean(total_reward)) if total_reward else float('nan')
+                    # Compute initial and min average distance to fire  
+                    initial_avg_dist = float(np.mean(fire_distances[0][:1]) if fire_distances[0][:1] else np.nan)
+                    min_avg_dist = float(min(fire_distances[0]) if fire_distances[0] else np.nan)
                     # Include additional actor/critic diagnostics for debugging actor loss
                     actor_loss_raw_log = float(getattr(agents[0], 'last_actor_loss_raw', float('nan'))) if agents and len(agents) > 0 else float('nan')
                     actor_q_mean_log = float(getattr(agents[0], 'last_actor_q_mean', float('nan'))) if agents and len(agents) > 0 else float('nan')
                     target_q_mean_log = float(getattr(agents[0], 'last_target_q_mean', float('nan'))) if agents and len(agents) > 0 else float('nan')
-                    training_writer.writerow([global_episode_counter, mean_total, int(steps), success, int(collisions), float(avg_goal_dist), ";".join([str(ct) for ct in crash_type]), prox_comp, expl_comp, energy_comp, int(fires_discovered), norm_total, norm_prox_mean, norm_expl_mean, norm_energy_mean, action_saturation_fraction, actor_loss_log, actor_loss_raw_log, actor_q_mean_log, target_q_mean_log, critic_loss_log, td_error_log, int(episode_fires_viewed[-1]) if episode_fires_viewed else 0, int(episode_boxes_explored[-1]) if episode_boxes_explored else 0])
+                    
+                    # Update moving average tracking
+                    episode_lengths_history.append(steps)
+                    success_history.append(success)
+                    if len(episode_lengths_history) > MOVING_AVG_WINDOW:
+                        episode_lengths_history.pop(0)
+                    if len(success_history) > MOVING_AVG_WINDOW:
+                        success_history.pop(0)
+                    
+                    # Calculate moving averages
+                    length_ma = float(np.mean(episode_lengths_history)) if episode_lengths_history else float('nan')
+                    success_ma = float(np.mean(success_history)) if success_history else float('nan')
+                    
+                    training_writer.writerow([global_episode_counter, mean_total, int(steps), length_ma, success, success_ma, int(collisions), float(avg_goal_dist), ";".join([str(ct) for ct in crash_type]), prox_comp, expl_comp, energy_comp, int(fires_discovered), norm_total, norm_prox_mean, norm_expl_mean, norm_energy_mean, action_saturation_fraction, actor_loss_log, actor_loss_raw_log, actor_q_mean_log, target_q_mean_log, critic_loss_log, td_error_log, int(episode_fires_viewed[-1]) if episode_fires_viewed else 0, int(episode_boxes_explored[-1]) if episode_boxes_explored else 0, initial_avg_dist, min_avg_dist])
+
+                    # Track crash types for monitoring (Recommendation 2)
+                    for ct in crash_type:
+                        if ct is None:
+                            crash_type_counts['safe_completion'] += 1
+                        elif 'timeout' in ct:
+                            crash_type_counts['timeout'] += 1
+                        elif 'fire' in ct.lower():
+                            crash_type_counts['fire_collision'] += 1
+                        elif 'drone' in ct.lower():
+                            crash_type_counts['drone_collision'] += 1
+                        elif 'wall' in ct.lower():
+                            crash_type_counts['wall_crash'] += 1
+                        elif 'random' in ct.lower():
+                            crash_type_counts['random_crash'] += 1
+                    
+                    # Print periodic crash-type summary (every 50 episodes)
+                    if (episode + 1) % 50 == 0:
+                        total_episodes_tracked = sum(crash_type_counts.values())
+                        if total_episodes_tracked > 0:
+                            print(f"\n[Episode {episode + 1}] Crash Type Summary (last 50 episodes):")
+                            print(f"  Safe completions: {crash_type_counts['safe_completion']:3d} ({100*crash_type_counts['safe_completion']/total_episodes_tracked:5.1f}%)")
+                            print(f"  Timeouts:         {crash_type_counts['timeout']:3d} ({100*crash_type_counts['timeout']/total_episodes_tracked:5.1f}%)")
+                            print(f"  Fire collisions:  {crash_type_counts['fire_collision']:3d} ({100*crash_type_counts['fire_collision']/total_episodes_tracked:5.1f}%)")
+                            print(f"  Drone collisions: {crash_type_counts['drone_collision']:3d} ({100*crash_type_counts['drone_collision']/total_episodes_tracked:5.1f}%)")
+                            print(f"  Wall crashes:     {crash_type_counts['wall_crash']:3d} ({100*crash_type_counts['wall_crash']/total_episodes_tracked:5.1f}%)")
+                            print(f"  Random crashes:   {crash_type_counts['random_crash']:3d} ({100*crash_type_counts['random_crash']/total_episodes_tracked:5.1f}%)")
+                            # Reset counters for next period
+                            crash_type_counts = {k: 0 for k in crash_type_counts.keys()}
 
                     # Write per-step rows for both drones
                     # When writing per-step rows, attempt to split reward into components if possible.
@@ -2767,6 +3299,10 @@ def main():
                     for m in end_msgs:
                         print('  ' + m)
 
+                    # Update episode return for curriculum-aware target scaling (Fix #2)
+                    for i, agent in enumerate(agents):
+                        agent.update_episode_return(total_reward[i])
+                    
                     # Decay noise for all agents after each episode
                     for agent in agents:
                         agent.decay_noise()

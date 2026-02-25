@@ -31,12 +31,14 @@ class AblationEvaluator:
     """Evaluate pre-trained agents under different ablation configurations."""
     
     def __init__(self, scenario, episodes_per_mode=500, steps_per_episode=300, 
-                 curriculum_level=4, output_dir='logs/ablation_eval'):
+                 curriculum_level=4, output_dir='logs/ablation_eval', seed=None):
         self.scenario = scenario
         self.episodes_per_mode = episodes_per_mode
         self.steps_per_episode = steps_per_episode
         self.curriculum_level = curriculum_level
         self.output_dir = Path(output_dir)
+        # Optional deterministic seed for evaluation reproducibility
+        self.seed = seed
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
         # Create environment once to get dimensions
@@ -72,17 +74,39 @@ class AblationEvaluator:
         # Copy to second agent for consistency
         agents[1].actor.load_state_dict(agents[0].actor.state_dict())
         agents[1].actor_target.load_state_dict(agents[0].actor_target.state_dict())
+        # Put actor networks into eval mode to avoid any training-only behaviour
+        for a in agents:
+            try:
+                a.actor.eval()
+                a.actor_target.eval()
+                # ensure agent-level deterministic behaviour
+                try:
+                    a.eval_mode = True
+                except Exception:
+                    pass
+            except Exception:
+                pass
         
         return agents
     
     def run_episode_deterministic(self, env, agents, episode_num):
         """Run a single deterministic episode and return metrics."""
-        obs, _ = env.reset()
+        # Reset environment deterministically if a base seed was provided
+        if getattr(self, 'seed', None) is not None:
+            try:
+                seed = int(self.seed) + int(episode_num)
+                obs, _ = env.reset(seed=seed)
+            except Exception:
+                obs, _ = env.reset()
+        else:
+            obs, _ = env.reset()
         done = [False, False]
         steps = 0
         total_reward = [0.0, 0.0]
         seen_grids = [set(), set()]
         env.fires_visited = [set(), set()]
+        # Track whether each drone crashed (hit fire or wall)
+        crashed = [False for _ in range(env.n_drones)]
         
         while not all(done) and steps < self.steps_per_episode:
             actions = np.zeros((env.n_drones, 3))
@@ -93,6 +117,13 @@ class AblationEvaluator:
             next_obs, rewards, done, _, info = env.step(actions, seen_grids=seen_grids)
             for i in range(env.n_drones):
                 total_reward[i] += float(np.clip(rewards[i], -REWARD_CLIP, REWARD_CLIP))
+                # If this step set done for this drone and the reward equals the collision penalty,
+                # treat it as a crash for success-rate calculation.
+                try:
+                    if done[i] and float(rewards[i]) <= float(COLLISION_PENALTY) + 1e-8:
+                        crashed[i] = True
+                except Exception:
+                    pass
             
             obs = next_obs
             steps += 1
@@ -102,7 +133,9 @@ class AblationEvaluator:
         all_fires = set().union(*(getattr(env, 'fires_visited', [set(), set()])))
         fires_viewed = len(all_fires)
         boxes_explored = len(set().union(*seen_grids)) if seen_grids else 0
-        success = 1 if all(r > COLLISION_PENALTY for r in total_reward) else 0
+        # Success: did not crash (redefined per user request)
+        # We record success as simply "did not crash" so evaluation focuses on safety
+        success = 1 if (not any(crashed)) else 0
         
         return {
             'episode': episode_num,
@@ -144,6 +177,24 @@ class AblationEvaluator:
         except Exception as e:
             print(f"✗ Failed to load agents: {e}")
             return None
+
+        # Set deterministic seeds for evaluation if provided
+        if self.seed is not None:
+            try:
+                import random as _random
+                _random.seed(self.seed)
+            except Exception:
+                pass
+            try:
+                np.random.seed(self.seed)
+            except Exception:
+                pass
+            try:
+                torch.manual_seed(self.seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(self.seed)
+            except Exception:
+                pass
         
         # Save original REWARD_COMPONENTS
         original_components = REWARD_COMPONENTS.copy()
@@ -215,7 +266,33 @@ class AblationEvaluator:
         print(f"\nFound {len(pkl_files)} PKL files to evaluate")
         
         for pkl_path in pkl_files:
-            self.evaluate_pkl_file(pkl_path)
+            # Infer mode name and component config from filename when possible.
+            # Expected filename patterns: ablation_baseline_all_on_agent_0.pkl or ablation_no_<component>_agent_0.pkl
+            stem = Path(pkl_path).stem
+            # remove leading 'ablation_' if present
+            mode = stem
+            if mode.startswith('ablation_'):
+                mode = mode[len('ablation_'):]
+            # trim any trailing agent suffix
+            if '_agent' in mode:
+                mode = mode.split('_agent')[0]
+
+            component_config = None
+            if mode != 'baseline_all_on':
+                # build a config that disables the named component if it exists
+                # support names like 'no_proximity' or 'no_cell_regen'
+                if mode.startswith('no_'):
+                    comp_name = mode[len('no_'):]
+                    if comp_name in REWARD_COMPONENTS:
+                        component_config = {k: True for k in REWARD_COMPONENTS}
+                        component_config[comp_name] = False
+                else:
+                    # fallback: if mode matches a key exactly, disable it
+                    if mode in REWARD_COMPONENTS:
+                        component_config = {k: True for k in REWARD_COMPONENTS}
+                        component_config[mode] = False
+
+            self.evaluate_pkl_file(pkl_path, mode_name=mode, component_config=component_config)
         
         return self.results
     
@@ -501,15 +578,21 @@ def convert_agent():
     
     output_dir = input("Enter output directory (default: logs): ").strip() or "logs"
     
-    # Define ablation configurations
+    # Define ablation configurations in the requested sequential order:
+    # baseline, cell_regen, discovery, edge, energy, exploration, lateral,
+    # movement, optimal, proximity, stationary_penalty
     ablation_configs = {
         'baseline_all_on': {k: True for k in REWARD_COMPONENTS},
-        'no_proximity': {k: (k != 'proximity') for k in REWARD_COMPONENTS},
-        'no_exploration': {k: (k != 'exploration') for k in REWARD_COMPONENTS},
-        'no_energy': {k: (k != 'energy') for k in REWARD_COMPONENTS},
-        'no_edge': {k: (k != 'edge') for k in REWARD_COMPONENTS},
-        'no_movement': {k: (k != 'movement') for k in REWARD_COMPONENTS},
+        'no_cell_regen': {k: (k != 'cell_regen') for k in REWARD_COMPONENTS},
         'no_discovery': {k: (k != 'discovery') for k in REWARD_COMPONENTS},
+        'no_edge': {k: (k != 'edge') for k in REWARD_COMPONENTS},
+        'no_energy': {k: (k != 'energy') for k in REWARD_COMPONENTS},
+        'no_exploration': {k: (k != 'exploration') for k in REWARD_COMPONENTS},
+        'no_lateral': {k: (k != 'lateral') for k in REWARD_COMPONENTS},
+        'no_movement': {k: (k != 'movement') for k in REWARD_COMPONENTS},
+        'no_optimal': {k: (k != 'optimal') for k in REWARD_COMPONENTS},
+        'no_proximity': {k: (k != 'proximity') for k in REWARD_COMPONENTS},
+        'no_stationary_penalty': {k: (k != 'stationary_penalty') for k in REWARD_COMPONENTS},
     }
     
     # Convert
