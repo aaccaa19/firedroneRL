@@ -1,0 +1,7 @@
+scenario/pattern,expanding_square,sector,parallel_sweep,track_line,creeping_line,area_box
+1,89,78,37,18,164,
+2,89,78,37,18,166,90
+3,89,54,37,19,133,
+4,89,20,29,18,166,21
+5,89,78,37,18,166,
+6,83,17,23,11,137,18

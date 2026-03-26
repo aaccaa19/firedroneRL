@@ -2426,7 +2426,7 @@ def main():
             
             fig.tight_layout()
             outp = plots_dir / f'ablation_summary_s{ablation_scenario}_e{episodes_per_mode}.png'
-            fig.savefig(outp, dpi=100)
+            fig.savefig(outp, dpi=1000)
             print(f"Saved ablation summary plot to {outp}")
         except Exception as e:
             print("Failed to produce ablation summary plot:", e)
